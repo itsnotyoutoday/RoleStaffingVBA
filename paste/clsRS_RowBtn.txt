@@ -1,0 +1,32 @@
+Option Explicit
+'==============================================================================
+' Role Staffing: click handler for one runtime-created button.
+'
+' A button made at runtime has no event procedure - there's no module for one to
+' live in. WithEvents in a class is how you catch it: one instance per button,
+' each holding the row it belongs to.
+'
+' The instances MUST be kept alive by something outside this class, or the
+' buttons stop responding the moment the creating procedure ends.
+' gRS_RowBtns is that something; RS_CheckRowsDone empties it when the form
+' closes.
+'
+' These are MSForms control events, not Project application events - the
+' signature is fixed and the same everywhere, which is why this is safe where
+' guessing at App_ProjectBeforeTaskChange wasn't.
+'==============================================================================
+
+Private WithEvents mBtn As MSForms.CommandButton
+Private mForm As Object
+Private mRow As Long
+
+Public Sub Attach(btn As MSForms.CommandButton, f As Object, ByVal rowIndex As Long)
+    Set mBtn = btn
+    Set mForm = f
+    mRow = rowIndex
+End Sub
+
+Private Sub mBtn_Click()
+    On Error Resume Next
+    RS_FixRow mForm, mRow
+End Sub

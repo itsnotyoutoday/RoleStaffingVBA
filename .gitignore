@@ -1,0 +1,22 @@
+.DS_Store
+~$*
+*.tmp
+
+# VBAlidator's report, written wherever it's run from
+vba_report.json
+
+# Python scratch from tools/
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# A VBA-Docs clone, if you put one in the tree. tools/model/extract_vbadocs.py
+# needs it once; models/sources/project_api.json is the committed result, so
+# nobody needs the clone again.
+VBA-Docs/
+
+# The Project type model and its generator both live in the VBAlidator
+# submodule now - that's where `vbalidator --host project` reads it from, and
+# where it can go upstream. Nothing model-related belongs in this repo.
+models/

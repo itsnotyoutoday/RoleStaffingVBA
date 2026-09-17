@@ -1,0 +1,7 @@
+# VBA source is imported by Windows MS Project, which needs CRLF.
+# Without this the importer can't parse the .cls header and reports
+# "Expected: end of statement" on VERSION 1.0 CLASS.
+# -text stops git normalising, so GitHub's Raw view serves CRLF too.
+*.bas -text
+*.cls -text
+paste/*.txt -text

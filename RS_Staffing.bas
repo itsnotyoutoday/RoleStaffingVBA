@@ -1,0 +1,1587 @@
+Attribute VB_Name = "RS_Staffing"
+Option Explicit
+'==============================================================================
+' ROLE STAFFING - RS_Staffing
+'
+' Putting people on tasks and working out when the work happens: suggest, apply,
+' unstaff, level, level-of-effort, and the forward scheduler.
+'
+' Not called RS_Level: a module can't share a name with a procedure, and
+' RS_Level is one of the macros in here.
+'
+' All four modules share one namespace, so nothing needs importing between them -
+' but RoleStaffing holds the state they all use, so import that one first.
+'==============================================================================
+
+'==============================================================================
+' SUGGEST
+'==============================================================================
+
+Public Sub RS_Suggest()
+    Dim p As Project
+    If Not HaveProject(p) Then Exit Sub
+    FastOn "working out who should do what"
+
+    Dim items() As Variant, n As Long, i As Long
+    Dim t As Task, a As Assignment, r As Resource, role As String
+    Dim ww As Object, k As Variant, demand As Double
+    Dim onTask As Object, a2 As Assignment
+    Dim cands As Collection, best As Variant, c As Variant
+    Dim excluded As Collection, notes As String, why As String
+    Dim rep As New Collection, staffed As Long, unstaffed As Long
+    Dim undoOpen As Boolean
+
+    On Error GoTo Fail
+    ApplyPendingTags p
+    BuildCatalog p
+    BuildRules
+    BuildLoad p
+    BuildRelations p
+
+    If RoleNames().Count = 0 Then
+        MsgBox "No roles found. Fill in RoleAvail on the resource sheet first, " & _
+               "e.g. ""Check:40,Draft:20"".", vbInformation, "Role Staffing"
+        Exit Sub
+    End If
+
+    For Each t In p.Tasks
+        If Not t Is Nothing Then
+            For Each a In t.Assignments
+                Set r = ResourceOf(p, a)
+                If IsBucket(r) Then
+                    role = BucketRole(r)
+                    If role <> "" Then
+                        ReDim Preserve items(0 To n)
+                        items(n) = Array(CDbl(t.Priority), CDbl(a.Start), t.UniqueID, a.UniqueID, role)
+                        n = n + 1
+                    End If
+                End If
+            Next a
+        End If
+    Next t
+
+    If n = 0 Then
+        FastOff
+        MsgBox "Nothing to staff." & vbCrLf & vbCrLf & _
+               "Assign a bucket resource (the rows with IsRole filled in) to the tasks " & _
+               "that need somebody. That's what tells this macro a slot is open.", _
+               vbInformation, "Role Staffing"
+        Exit Sub
+    End If
+
+    SortItems items, n
+
+    Application.OpenUndoTransaction "Role Staffing: suggest"
+    undoOpen = True
+    gRS_Suppress = gRS_Suppress + 1
+
+    rep.Add "Rules in force: " & IIf(RulesText() = "", "(none)", RulesText())
+    rep.Add ""
+
+    For i = 0 To n - 1
+        If (i Mod 10) = 0 Then Progress "slot", i + 1, n
+        Set t = TaskByUid(p, CLng(items(i)(2)))
+        If Not t Is Nothing Then Set a = FindAssignment(t, CLng(items(i)(3))) Else Set a = Nothing
+        If Not a Is Nothing Then
+            role = CStr(items(i)(4))
+            Set ww = WeeklyWork(a)
+            demand = SumDict(ww)
+            Set cands = New Collection
+            Set excluded = New Collection
+
+            ' Who is already on this task - once, not once per candidate.
+            Set onTask = NewDict()
+            For Each a2 In t.Assignments
+                onTask(CStr(a2.ResourceID)) = True
+            Next a2
+
+            For Each r In People()
+                If True Then
+                    If HasRole(r, role) Then
+                        If onTask.Exists(CStr(r.ID)) Then
+                            excluded.Add r.Name & ": already on this task"
+                        Else
+                            why = FindConflict(t.UniqueID, r.ID, role)
+                            If why <> "" Then
+                                excluded.Add r.Name & ": " & why
+                            Else
+                                InsertCandidate cands, ScorePerson(r, role, ww, demand)
+                            End If
+                        End If
+                    End If
+                End If
+            Next r
+
+            notes = ""
+            If TouchesRules(CStr(t.UniqueID)) Then
+                If CoverKind(CStr(t.UniqueID)) = "Links" And UpstreamOf(CStr(t.UniqueID)).Count = 0 Then
+                    notes = notes & "Related work not found, so rules couldn't be applied here. "
+                End If
+            End If
+
+            rep.Add "Task " & t.ID & "  " & t.Name & "   [" & role & _
+                    IIf(CBool(t.Summary), " level-of-effort " & Pct(ToFraction(a.Units)), "") & "]"
+            rep.Add "   " & Format$(a.Start, "Short Date") & " - " & Format$(a.Finish, "Short Date") & _
+                    "   " & Format$(ToDbl(a.Work) / 60, "0.#") & " h   " & DescribeRelated(t.UniqueID)
+
+            If cands.Count > 0 Then
+                best = cands(1)
+                If best(3) > 0 Then
+                    notes = notes & "Past their real availability some weeks; level after applying. "
+                ElseIf best(2) > 0 Then
+                    notes = notes & "Borrows time from their other roles some weeks. "
+                End If
+                SetSuggestion a, CStr(best(0)), "Score " & Format$(best(1), "0") & ". " & notes
+                For Each k In ww.Keys
+                    AddLoad CLng(best(5)), role, CStr(k), ToDbl(ww(k))
+                Next k
+                AddTentative t.UniqueID, CLng(best(5)), role
+                staffed = staffed + 1
+                rep.Add "   -> Suggested: " & best(0)
+            Else
+                SetSuggestion a, "", "Nobody qualified and eligible for " & role & ". " & notes
+                unstaffed = unstaffed + 1
+                rep.Add "   -> Nobody qualified and eligible."
+            End If
+
+            If cands.Count > 0 Then
+                rep.Add "   Candidates:"
+                For Each c In cands
+                    rep.Add "      " & PadR(CStr(c(0)), 24) & _
+                            " share " & PadL(Pct(CDbl(c(6))), 4) & IIf(c(4), "*", " ") & _
+                            "   score " & PadL(Format$(c(1), "0"), 4) & _
+                            "   borrowed " & PadL(Pct(CDbl(c(2))), 4) & _
+                            "   over availability " & PadL(Pct(CDbl(c(3))), 4)
+                Next c
+            End If
+            If excluded.Count > 0 Then
+                rep.Add "   Excluded:"
+                For Each c In excluded
+                    rep.Add "      " & CStr(c)
+                Next c
+            End If
+            If notes <> "" Then rep.Add "   Notes: " & notes
+            rep.Add ""
+        End If
+    Next i
+
+    gRS_Suppress = gRS_Suppress - 1
+    Application.CloseUndoTransaction
+    undoOpen = False
+
+    rep.Add "Suggested is written on the ASSIGNMENT row, so you must be in a TASK USAGE view"
+    rep.Add "to see it - a Gantt Chart has no assignment rows and the column will read blank."
+    rep.Add "Use the ""RS Staffing"" view, expand a task, change or clear names there,"
+    rep.Add "then run RS_Apply. Changing a name doesn't re-score the others; re-run Suggest for that."
+    FastOff
+    ShowReport "Staffing Suggestions", rep
+
+    Dim switched As Boolean
+    On Error Resume Next
+    PA.ViewApply Name:="RS Staffing"
+    switched = (Err.Number = 0)
+    Err.Clear
+    On Error GoTo 0
+
+    If Not gRS_Auto Then
+        Dim tail As String
+        If switched Then
+            tail = "Expand a task (the little arrow) to see its assignment rows - " & _
+                   "that's where Suggested lives."
+        Else
+            tail = "IMPORTANT: switch to a TASK USAGE view first (View > Task Usage). " & _
+                   "Suggested is written on the ASSIGNMENT row, and a Gantt Chart has no " & _
+                   "assignment rows - so the column reads blank there however well this worked."
+        End If
+        MsgBox staffed & " slot(s) have a suggestion, " & unstaffed & " have none." & vbCrLf & vbCrLf & _
+               tail & vbCrLf & vbCrLf & "Then run RS_Apply.", vbInformation, "Role Staffing"
+    End If
+    Exit Sub
+
+Fail:
+    FastOff
+    If undoOpen Then
+        gRS_Suppress = gRS_Suppress - 1
+        Application.CloseUndoTransaction
+    End If
+    MsgBox "Suggest failed: " & Err.Description, vbExclamation, "Role Staffing"
+End Sub
+
+' Array(name, score, borrowedFraction, overMaxFraction, isPrimary, resId, share)
+Private Function ScorePerson(r As Resource, ByVal role As String, ww As Object, ByVal demand As Double) As Variant
+    Dim target As Double, cap As Double, k As Variant, d As Double
+    Dim roleRemain As Double, totalRemain As Double
+    Dim borrowed As Double, overMax As Double, headroom As Double, weeks As Long
+    Dim bf As Double, om As Double, hr As Double, s As Double, share As Double
+
+    share = RoleShare(r, role)
+    target = RoleTarget(r, role)
+    cap = TotalCapacity(r)
+
+    For Each k In ww.Keys
+        d = ToDbl(ww(k))
+        roleRemain = MaxD(0, target - RoleLoad(r.ID, role, CStr(k)))
+        totalRemain = MaxD(0, cap - TotalLoad(r.ID, CStr(k)))
+        borrowed = borrowed + MaxD(0, d - roleRemain)   ' soft: lends from other roles
+        overMax = overMax + MaxD(0, d - totalRemain)    ' firm: past real availability
+        If cap > 0 Then headroom = headroom + MaxD(0, totalRemain - d) / cap
+        weeks = weeks + 1
+    Next k
+
+    If demand > 0 Then
+        bf = borrowed / demand
+        om = overMax / demand
+    End If
+    If weeks > 0 Then hr = headroom / weeks
+
+    s = W_PREFERENCE * share
+    If IsPrimaryFor(r, role) Then s = s + W_PRIMARY
+    s = s - W_DRIFT * bf - W_OVER_MAX * om + W_HEADROOM * hr
+
+    ScorePerson = Array(r.Name, s, bf, om, IsPrimaryFor(r, role), r.ID, share)
+End Function
+
+Private Sub InsertCandidate(cands As Collection, c As Variant)
+    Dim i As Long
+    For i = 1 To cands.Count
+        If c(1) > cands(i)(1) Then
+            cands.Add c, Before:=i
+            Exit Sub
+        End If
+    Next i
+    cands.Add c
+End Sub
+
+Private Sub SortItems(items() As Variant, ByVal n As Long)
+    Dim i As Long, j As Long, tmp As Variant
+    For i = 1 To n - 1
+        tmp = items(i)
+        j = i - 1
+        Do While j >= 0
+            If ComesBefore(tmp, items(j)) Then
+                items(j + 1) = items(j)
+                j = j - 1
+            Else
+                Exit Do
+            End If
+        Loop
+        items(j + 1) = tmp
+    Next i
+End Sub
+
+Private Function ComesBefore(a As Variant, b As Variant) As Boolean
+    If a(0) <> b(0) Then
+        ComesBefore = (a(0) > b(0))
+    Else
+        ComesBefore = (a(1) < b(1))
+    End If
+End Function
+
+
+'==============================================================================
+' APPLY
+'==============================================================================
+
+Public Sub RS_Apply()
+    Dim p As Project
+    If Not HaveProject(p) Then Exit Sub
+    FastOn "staffing the tasks"
+    If Not gRS_Auto Then
+        If MsgBox("Replace each bucket with the person named in its Suggested field?", _
+                  vbOKCancel + vbQuestion, "Role Staffing") <> vbOK Then Exit Sub
+    End If
+
+    Dim t As Task, a As Assignment, na As Assignment, bucket As Resource, r As Resource
+    Dim list As Collection, x As Variant, nm As String, role As String, why As String
+    Dim w As Variant, applied As Long, rep As New Collection, undoOpen As Boolean
+    Dim unitNote As String, stuckOne As Boolean, stuckCount As Long
+
+    On Error GoTo Fail
+    ApplyPendingTags p
+    BuildCatalog p
+    BuildRules
+    BuildRelations p
+
+    Application.OpenUndoTransaction "Role Staffing: apply"
+    undoOpen = True
+    gRS_Suppress = gRS_Suppress + 1
+
+    For Each t In p.Tasks
+        If Not t Is Nothing Then
+            Set list = New Collection
+            For Each a In t.Assignments
+                list.Add a
+            Next a
+
+            For Each x In list
+                Set a = x
+                nm = GetSuggested(a)
+                Set bucket = ResourceOf(p, a)
+                If nm <> "" And IsBucket(bucket) Then
+                    role = BucketRole(bucket)
+                    Set r = ResourceByName(p, nm)
+                    If r Is Nothing Then
+                        rep.Add "SKIPPED  task " & t.ID & " " & t.Name & ": no resource named """ & nm & """."
+                    ElseIf Not IsWorkPerson(r) Then
+                        rep.Add "SKIPPED  task " & t.ID & " " & t.Name & ": """ & nm & """ isn't a person."
+                    ElseIf PersonOnTask(t, r.ID) Then
+                        rep.Add "SKIPPED  task " & t.ID & " " & t.Name & ": " & nm & " is already on the task."
+                    Else
+                        why = FindConflict(t.UniqueID, r.ID, role)
+                        If why <> "" Then
+                            rep.Add "BLOCKED  task " & t.ID & " " & t.Name & ": " & nm & " " & why & "."
+                        Else
+                            If Not HasRole(r, role) Then
+                                rep.Add "WARNING  task " & t.ID & " " & t.Name & ": " & nm & _
+                                        " has no " & role & " in RoleAvail (applied anyway)."
+                            End If
+                            w = a.Work
+                            a.ResourceID = r.ID
+                            Set na = FindAssignmentByResource(t, r.ID)
+                            If na Is Nothing Then
+                                rep.Add "FAILED   task " & t.ID & " " & t.Name & ": Project didn't accept " & nm & "."
+                            Else
+                                SetAsgText na, mF_UnitStash, "u=" & Format$(ToFraction(na.Units), "0.####")
+                                unitNote = FitUnits(t, na, r, role, stuckOne)
+                                If stuckOne Then
+                                    stuckCount = stuckCount + 1
+                                    stuckOne = False
+                                End If
+                                If Abs(ToDbl(na.Work) - ToDbl(w)) > 0.5 Then na.Work = w
+                                SetAsgRole na, role
+                                SetSuggestion na, "", ""
+                                AddTentative t.UniqueID, r.ID, role
+                                applied = applied + 1
+                                rep.Add "OK       task " & t.ID & " " & t.Name & ": " & role & " -> " & nm & unitNote
+                            End If
+                        End If
+                    End If
+                End If
+            Next x
+        End If
+    Next t
+
+    gRS_Suppress = gRS_Suppress - 1
+    Application.CloseUndoTransaction
+    undoOpen = False
+
+    gRS_Applied = applied
+    If Not gRS_Auto Then
+        If applied > 0 Then
+            MsgBox applied & " assignment(s) staffed." & vbCrLf & vbCrLf & _
+                   "Next: run RS_Level to schedule it against everyone's real availability. " & _
+                   "(All of this is one Undo step if you don't like it.)", vbInformation, "Role Staffing"
+        Else
+            MsgBox "Nothing was applied. Check the report.", vbInformation, "Role Staffing"
+        End If
+    End If
+    If stuckCount > 0 Then
+        rep.Add ""
+        rep.Add "!! " & stuckCount & " task(s) did not stretch when their rate was reduced, which means"
+        rep.Add "!! they are Fixed Duration. On those, Project changed the WORK instead of the dates,"
+        rep.Add "!! so the schedule still assumes people are available more than they are."
+        rep.Add "!! Set those tasks to Fixed Work (Task Information > Advanced, or add a Type column)"
+        rep.Add "!! and re-run, or the finish date will be optimistic."
+    End If
+
+    FastOff
+    If rep.Count > 0 Then ShowReport "Staffing Applied", rep
+    Exit Sub
+
+Fail:
+    FastOff
+    If undoOpen Then
+        gRS_Suppress = gRS_Suppress - 1
+        Application.CloseUndoTransaction
+    End If
+    MsgBox "Apply failed: " & Err.Description, vbExclamation, "Role Staffing"
+End Sub
+
+' Sets the rate this person can really give the task, and checks the schedule
+' actually responded. See RS_UNITS_MODE.
+Private Function FitUnits(t As Task, a As Assignment, r As Resource, ByVal role As String, _
+                          ByRef stuckType As Boolean) As String
+    Dim have As Double, maxU As Double, want As Double
+    Dim durBefore As Double, durAfter As Double
+
+    If RS_UNITS_MODE = 0 Then Exit Function
+
+    ' A deliberate trickle - 64 h spread over eight months is about 4% of
+    ' somebody. Raising that to their Max Units would turn it into hundreds of
+    ' hours. Covers hammocks as well as summaries: a hammock IS the
+    ' level-of-effort now, and testing only for summaries missed it entirely.
+    If IsStretched(t) Then Exit Function
+
+    have = ToFraction(a.Units)
+    maxU = ToFraction(r.MaxUnits)
+    If maxU <= 0 Then Exit Function
+
+    want = maxU
+    If RS_UNITS_MODE = 2 Then
+        If RoleShare(r, role) > 0 Then want = maxU * RoleShare(r, role)
+    End If
+    If want > maxU Then want = maxU
+    If want <= 0 Then Exit Function
+    If Abs(want - have) < 0.005 Then Exit Function
+
+    durBefore = ToDbl(t.Duration)
+
+    On Error Resume Next
+    a.Units = want
+    If Abs(ToFraction(a.Units) - want) > 0.001 Then a.Units = want * 100
+    On Error GoTo 0
+
+    durAfter = ToDbl(t.Duration)
+    FitUnits = "   (units " & Pct(have) & " -> " & Pct(want) & ")"
+
+    ' Dropping the rate should lengthen the task. If it didn't, this is a Fixed
+    ' Duration task and Project moved Work instead - the stretch is a no-op.
+    If want < have - 0.005 And durAfter <= durBefore + 0.0001 Then
+        stuckType = True
+        FitUnits = FitUnits & " - duration didn't move, task isn't Fixed Work"
+    End If
+End Function
+
+Public Sub RS_ClearSuggestions()
+    Dim p As Project, t As Task, a As Assignment
+    If Not HaveProject(p) Then Exit Sub
+    Application.OpenUndoTransaction "Role Staffing: clear suggestions"
+    gRS_Suppress = gRS_Suppress + 1
+    On Error Resume Next
+    For Each t In p.Tasks
+        If Not t Is Nothing Then
+            For Each a In t.Assignments
+                If GetSuggested(a) <> "" Then SetSuggestion a, "", ""
+            Next a
+        End If
+    Next t
+    On Error GoTo 0
+    gRS_Suppress = gRS_Suppress - 1
+    Application.CloseUndoTransaction
+End Sub
+
+
+'==============================================================================
+' UNSTAFF
+'
+' Puts people back onto the role rows they came from, so a run can simply be
+' repeated. RS_Apply consumes the role row when it staffs a task, so without
+' this a second run would find nothing to staff and look broken.
+'
+' An assignment is put back if the person is filling a role that has a role row
+' to go back to. Work is preserved. Levelling delay is cleared as well, so the
+' dates start from the same place they did the first time.
+'==============================================================================
+
+Public Sub RS_Unstaff()
+    Dim p As Project
+    If Not HaveProject(p) Then Exit Sub
+    If MsgBox("Put every staffed assignment back to its role row?" & vbCrLf & vbCrLf & _
+              "Work is kept, levelling is cleared, and the schedule goes back to unstaffed " & _
+              "demand ready for another run.", vbOKCancel + vbQuestion, "Role Staffing") <> vbOK Then Exit Sub
+    MsgBox Unstaff(p) & " assignment(s) put back to role rows.", vbInformation, "Role Staffing"
+End Sub
+
+' Puts a role row's units back to the demand it stood for. RS_Apply stashes the
+' original on the assignment, because otherwise the placeholder would inherit
+' whatever rate the PERSON was working at - 80%, 40%, sometimes 0 - and the next
+' run would start from numbers that mean nothing.
+'
+' With no stash: 100% (one full-time person's worth), except on a summary task,
+' where the units are a deliberate level-of-effort percentage and must be left.
+Private Sub RestoreUnits(t As Task, a As Assignment, ByVal stash As String)
+    Dim want As Double
+    On Error Resume Next
+
+    If Left$(stash, 2) = "u=" Then
+        want = ToDbl(Mid$(stash, 3))
+    ElseIf IsStretched(t) Then
+        SetAsgText a, mF_UnitStash, ""
+        Exit Sub                      ' spread thin on purpose: the rate is the point
+    Else
+        want = 1
+    End If
+
+    If want > 0 Then
+        a.Units = want
+        If Abs(ToFraction(a.Units) - want) > 0.001 Then a.Units = want * 100
+    End If
+    SetAsgText a, mF_UnitStash, ""
+End Sub
+
+Public Function Unstaff(p As Project) As Long
+    Dim t As Task, a As Assignment, na As Assignment, r As Resource, bucket As Resource
+    Dim list As Collection, x As Variant, role As String, w As Variant, n As Long
+    Dim origU As String
+
+    BuildCatalog p
+    FastOn "putting people back"
+    Application.OpenUndoTransaction "Role Staffing: unstaff"
+    gRS_Suppress = gRS_Suppress + 1
+    On Error Resume Next
+
+    For Each t In p.Tasks
+        If Not t Is Nothing Then
+            Set list = New Collection
+            For Each a In t.Assignments
+                list.Add a
+            Next a
+            For Each x In list
+                Set a = x
+                Set r = ResourceOf(p, a)
+                If IsWorkPerson(r) Then
+                    role = InferRole(a, r, t)
+                    If role <> "" Then
+                        Set bucket = BucketFor(p, role)
+                        If Not bucket Is Nothing Then
+                            w = a.Work
+                            origU = Trim$(AsgText(a, mF_UnitStash))
+                            a.ResourceID = bucket.ID
+                            Set na = FindAssignmentByResource(t, bucket.ID)
+                            If Not na Is Nothing Then
+                                If Abs(ToDbl(na.Work) - ToDbl(w)) > 0.5 Then na.Work = w
+                                RestoreUnits t, na, origU
+                                SetAsgRole na, role
+                                SetSuggestion na, "", ""
+                                n = n + 1
+                            End If
+                        End If
+                    End If
+                End If
+            Next x
+        End If
+    Next t
+
+    PA.ClearLeveling All:=True
+
+    gRS_Suppress = gRS_Suppress - 1
+    Application.CloseUndoTransaction
+    On Error GoTo 0
+    FastOff
+    Unstaff = n
+End Function
+
+
+'==============================================================================
+' ONE-SHOT: STAFF AND SCHEDULE
+'
+' Suggest, apply, level - in one go, no review step. Use this when you just want
+' people on the tasks and a finish date. Everything it does is one Undo.
+'
+' RS_Suggest / RS_Apply separately still exist if you want to look over the
+' picks before committing them.
+'==============================================================================
+
+Public Sub RS_AutoStaff()
+    Dim p As Project
+    If Not HaveProject(p) Then Exit Sub
+    FastOn "staffing and scheduling"
+
+    Dim slots As Long, t As Task, a As Assignment
+    BuildCatalog p
+    For Each t In p.Tasks
+        If Not t Is Nothing Then
+            For Each a In t.Assignments
+                If IsBucket(ResourceOf(p, a)) Then slots = slots + 1
+            Next a
+        End If
+    Next t
+
+    ' Anything already staffed? Offer to redo it, so a second run just works.
+    Dim staffedAlready As Long, rr As Resource
+    For Each t In p.Tasks
+        If Not t Is Nothing Then
+            For Each a In t.Assignments
+                Set rr = ResourceOf(p, a)
+                If IsWorkPerson(rr) Then
+                    If InferRole(a, rr, t) <> "" Then staffedAlready = staffedAlready + 1
+                End If
+            Next a
+        End If
+    Next t
+
+    If staffedAlready > 0 Then
+        Select Case MsgBox(staffedAlready & " assignment(s) are already staffed." & vbCrLf & vbCrLf & _
+                           "YES  - put them back and work the whole thing out again" & vbCrLf & _
+                           "NO   - leave them alone and only fill the " & slots & " empty slot(s)" & vbCrLf & _
+                           "CANCEL - stop", vbYesNoCancel + vbQuestion, "Role Staffing")
+            Case vbYes
+                Unstaff p
+                slots = 0
+                For Each t In p.Tasks
+                    If Not t Is Nothing Then
+                        For Each a In t.Assignments
+                            If IsBucket(ResourceOf(p, a)) Then slots = slots + 1
+                        Next a
+                    End If
+                Next t
+            Case vbCancel
+                FastOff
+                Exit Sub
+        End Select
+    End If
+
+    If slots = 0 Then
+        FastOff
+        MsgBox "Nothing to staff - no task has a role row on it." & vbCrLf & vbCrLf & _
+               "If your Gantt already shows role names (Engineer, Checker...) in Resource " & _
+               "Names, run RS_MarkRoles first: it tells the macros those rows are roles " & _
+               "rather than people.", vbInformation, "Role Staffing"
+        Exit Sub
+    End If
+
+    If MsgBox("Staff and schedule " & slots & " open slot(s)?" & vbCrLf & vbCrLf & _
+              "1. pick the best available person for each" & vbCrLf & _
+              "2. put them into Resource Names" & vbCrLf & _
+              "3. level the schedule against everyone's real availability" & vbCrLf & vbCrLf & _
+              "One Undo puts it all back. Reports open as it goes.", _
+              vbOKCancel + vbQuestion, "Role Staffing") <> vbOK Then
+        FastOff
+        Exit Sub
+    End If
+
+    gRS_Auto = True
+    gRS_Applied = 0
+    gRS_Moved = 0
+    On Error GoTo Fail
+
+    RS_Suggest
+    RS_Apply
+    If gRS_Applied > 0 Then RS_Level
+
+    gRS_Auto = False
+    FastOff
+
+    If gRS_Applied = 0 Then
+        MsgBox "Nobody was assigned." & vbCrLf & vbCrLf & _
+               "The Staffing Suggestions report that just opened says why, slot by slot - " & _
+               "look at the ""Excluded"" lines. The usual reasons are that nobody has that " & _
+               "role in their RoleAvail, or a rule (" & RulesText() & ") rules out the people " & _
+               "who do.", vbExclamation, "Role Staffing"
+    Else
+        MsgBox gRS_Applied & " assignment(s) staffed." & vbCrLf & vbCrLf & _
+               "Finish: " & Format$(gRS_Before, "yyyy-mm-dd") & "  ->  " & _
+               Format$(gRS_After, "yyyy-mm-dd") & vbCrLf & _
+               gRS_Moved & " task(s) delayed to fit people's availability." & vbCrLf & vbCrLf & _
+               "Undo puts it all back. Clear Leveling undoes just the dates.", _
+               vbInformation, "Role Staffing"
+    End If
+    Exit Sub
+
+Fail:
+    FastOff
+    gRS_Auto = False
+    MsgBox "Auto staff failed: " & Err.Description, vbExclamation, "Role Staffing"
+End Sub
+
+'==============================================================================
+' LEVEL
+' Real availability (Max Units) is the hard constraint, and that is exactly
+' what Project's own leveller understands. So we drive it rather than replace
+' it. Clear Leveling undoes everything it does.
+'==============================================================================
+
+Public Sub RS_Level()
+    Dim p As Project
+    If Not HaveProject(p) Then Exit Sub
+    FastOn "levelling"
+
+    Dim before As Date, after As Date, rep As New Collection
+    Dim t As Task, moved As Long, loe As Long, refitted As Long
+
+    On Error GoTo Fail
+    BuildCatalog p
+    before = p.ProjectFinish
+
+    ' Levelling only moves dates. Warn if the schedule is still full of unstaffed
+    ' slots, because then the date is based on placeholders, not real people.
+    Dim openSlots As Long, at As Task, aa As Assignment
+    For Each at In p.Tasks
+        If Not at Is Nothing Then
+            For Each aa In at.Assignments
+                If IsBucket(ResourceOf(p, aa)) Then openSlots = openSlots + 1
+            Next aa
+        End If
+    Next at
+
+    Dim ask As String
+    ask = "Level the schedule against everyone's real availability (Max Units)?" & vbCrLf & vbCrLf & _
+          "This only MOVES DATES. It does not assign anybody - RS_Suggest then " & _
+          "RS_Apply is what puts people into Resource Names." & vbCrLf & vbCrLf & _
+          "Undo with Resource > Level > Clear Leveling."
+    If openSlots > 0 Then
+        ask = ask & vbCrLf & vbCrLf & "WARNING: " & openSlots & " slot(s) are still unstaffed " & _
+              "(a role row, not a person, is on the task). The date you get back will be " & _
+              "based on those placeholders rather than real people's availability." & vbCrLf & vbCrLf & _
+              "Run RS_Suggest and RS_Apply first unless you know that's what you want."
+    End If
+    If Not gRS_Auto Then
+        If MsgBox(ask, vbOKCancel + vbQuestion, "Role Staffing") <> vbOK Then Exit Sub
+    End If
+
+    Application.OpenUndoTransaction "Role Staffing: level"
+    gRS_Suppress = gRS_Suppress + 1
+
+    ' Levelling has to be allowed to push the finish date, so LevelWithinSlack
+    ' must be off - with it on, nothing moves past existing slack and the whole
+    ' exercise is pointless. Argument names vary by version, so try the full set,
+    ' then just the one that matters, then give up and say so.
+    ' The one setting that matters is LevelWithinSlack:=False. With it on,
+    ' nothing can move past existing slack and the finish date can never change,
+    ' which makes the whole exercise pointless.
+    '
+    ' Argument names differ between Project versions, so try the documented
+    ' names, then the shorter form, then positionally - position works whatever
+    ' the arguments are called. Order is
+    '   Automatic, LevelOrder, LevelWithinSlack, LevelIndividual, LevelCanSplit
+    Dim optSet As Boolean
+    On Error Resume Next
+
+    PA.LevelingOptions Automatic:=False, LevelWithinSlack:=False, _
+                       LevelIndividual:=True, LevelCanSplit:=True
+    optSet = (Err.Number = 0)
+
+    If Not optSet Then
+        Err.Clear
+        PA.LevelingOptions LevelWithinSlack:=False
+        optSet = (Err.Number = 0)
+    End If
+
+    If Not optSet Then
+        Err.Clear
+        PA.LevelingOptions False, , False, True, True
+        optSet = (Err.Number = 0)
+    End If
+
+    If Not optSet Then
+        Err.Clear
+        PA.LevelingOptions False, , False
+        optSet = (Err.Number = 0)
+    End If
+
+    Err.Clear
+    PA.LevelNow All:=True
+    If Err.Number <> 0 Then
+        gRS_Suppress = gRS_Suppress - 1
+        Application.CloseUndoTransaction
+        MsgBox "Project's leveller reported: " & Err.Description, vbExclamation, "Role Staffing"
+        Exit Sub
+    End If
+    On Error GoTo Fail
+
+    ' Hammocks borrow their dates from the task they span, and levelling has
+    ' just moved those tasks. Nothing re-fitted them afterwards - RS_Level never
+    ' called BuildRelations at all - so a hammock kept the dates its target had
+    ' BEFORE levelling. That is how one came to span October to December while
+    ' the task it follows had been pushed out to the following August.
+    '
+    ' Inside the same transaction, so one Undo still covers levelling and the
+    ' re-fit together.
+    refitted = RefitSpans(p)
+
+    gRS_Suppress = gRS_Suppress - 1
+    Application.CloseUndoTransaction
+
+    after = p.ProjectFinish
+
+    For Each t In p.Tasks
+        If Not t Is Nothing Then
+            If ToDbl(t.LevelingDelay) > 0 Then
+                moved = moved + 1
+                rep.Add "Delayed  task " & t.ID & "  " & t.Name
+            End If
+            If IsStretched(t) Then
+                If t.Assignments.Count > 0 Then loe = loe + 1
+            End If
+        End If
+    Next t
+
+    If refitted > 0 Then
+        rep.Add "Re-fitted " & refitted & " hammock date(s) to the levelled schedule."
+    End If
+
+    If Not optSet Then
+        rep.Add "!! COULDN'T SET THE LEVELLING OPTIONS FROM CODE."
+        rep.Add "!! Set them by hand - once per file, then it sticks:"
+        rep.Add "!!"
+        rep.Add "!!    Resource tab > Level group > Levelling Options..."
+        rep.Add "!!"
+        rep.Add "!!    UNTICK  ""Level only within available slack""   <- the important one"
+        rep.Add "!!    TICK    ""Levelling can adjust individual assignments"""
+        rep.Add "!!    TICK    ""Levelling can create splits in remaining work"""
+        rep.Add "!!    SET     Levelling calculations: Manual"
+        rep.Add "!!"
+        rep.Add "!! With ""only within available slack"" left ON, nothing can move past the slack"
+        rep.Add "!! it already has, so the finish date below cannot have changed and means nothing."
+        rep.Add "!! Set it, then run this again."
+        rep.Add ""
+    End If
+
+    If openSlots > 0 Then
+        rep.Add "!! " & openSlots & " slot(s) were still unstaffed when this ran, so the dates below"
+        rep.Add "!! reflect placeholder demand, not real people. RS_Suggest then RS_Apply first."
+        rep.Add ""
+    End If
+
+    rep.Add ""
+    rep.Add "Finish before levelling: " & Format$(before, "yyyy-mm-dd")
+    rep.Add "Finish after levelling:  " & Format$(after, "yyyy-mm-dd")
+    rep.Add "Tasks delayed:           " & moved
+    If loe > 0 Then
+        rep.Add ""
+        rep.Add "NOTE: " & loe & " task(s) spread work across a span - summaries carrying"
+        rep.Add "level-of-effort, and hammocks borrowing another task's dates. Project's"
+        rep.Add "leveller moves neither: summary assignments it won't touch, and a hammock is"
+        rep.Add "manually scheduled, which levelling ignores by design."
+        rep.Add ""
+        rep.Add "Their hours are real and count against whoever holds them, so an"
+        rep.Add "overallocation caused by one of these CANNOT be cleared by levelling - it"
+        rep.Add "will still be red afterwards, and that is not a fault. Role load shows who."
+    End If
+    FastOff
+    ShowReport "Levelling", rep
+
+    gRS_Before = before
+    gRS_After = after
+    gRS_Moved = moved
+    If Not gRS_Auto Then
+        MsgBox "Finish moved from " & Format$(before, "yyyy-mm-dd") & " to " & _
+               Format$(after, "yyyy-mm-dd") & "." & vbCrLf & vbCrLf & _
+               moved & " task(s) delayed. Undo with Resource > Level > Clear Leveling." & _
+               IIf(optSet, "", vbCrLf & vbCrLf & _
+                   "WARNING: couldn't set the levelling options - untick ""Level only within " & _
+                   "available slack"" in Resource > Level > Levelling Options, or this result " & _
+                   "means nothing. See the report."), _
+               vbInformation, "Role Staffing"
+    End If
+    Exit Sub
+
+Fail:
+    FastOff
+    MsgBox "Level failed: " & Err.Description, vbExclamation, "Role Staffing"
+End Sub
+
+
+'==============================================================================
+' LEVEL-OF-EFFORT
+'==============================================================================
+
+Public Sub RS_AddLevelOfEffort()
+    Dim p As Project
+    If Not HaveProject(p) Then Exit Sub
+
+    Dim sel As Tasks, t As Task, a As Assignment, bucket As Resource
+    Dim roleIn As String, role As String, pctIn As String, frac As Double
+    Dim added As Long, updated As Long, notSummary As Long, found As Boolean
+    Dim x As Variant, avail As String
+
+    FastOn "adding level-of-effort"
+    BuildCatalog p
+    If RoleNames().Count = 0 Then
+        FastOff
+        MsgBox "No roles found. Fill in RoleAvail on the resource sheet first.", vbInformation, "Role Staffing"
+        Exit Sub
+    End If
+    For Each x In RoleNames()
+        If avail <> "" Then avail = avail & ", "
+        avail = avail & CStr(x)
+    Next x
+
+    On Error Resume Next
+    Set sel = ActiveSelection.Tasks
+    On Error GoTo 0
+    If sel Is Nothing Then
+        MsgBox "Select one or more tasks (ideally summary tasks) in a task view first.", vbInformation, "Role Staffing"
+        Exit Sub
+    End If
+    If sel.Count = 0 Then
+        MsgBox "Select one or more tasks (ideally summary tasks) in a task view first.", vbInformation, "Role Staffing"
+        Exit Sub
+    End If
+
+    roleIn = InputBox("Role for the ongoing support (" & avail & "):", "Level-of-Effort")
+    If roleIn = "" Then Exit Sub
+    role = NormalizeRole(roleIn)
+    If role = "" Then
+        MsgBox """" & roleIn & """ isn't one of the roles on the resource sheet.", vbExclamation, "Role Staffing"
+        Exit Sub
+    End If
+
+    pctIn = InputBox( _
+        "How much " & role & " support?" & vbCrLf & vbCrLf & _
+        "   15      15% of somebody's time, for as long as this runs" & vbCrLf & _
+        "   64h     64 hours in total, spread across the whole span" & vbCrLf & vbCrLf & _
+        "Hours is usually what you mean for a budget: a set number of hours to " & _
+        "last the length of the work, not a set share of a person.", _
+        "Level-of-Effort", "15")
+    If pctIn = "" Then Exit Sub
+
+    Dim asHours As Boolean, hrs As Double
+    pctIn = Trim$(pctIn)
+    If LCase$(Right$(pctIn, 1)) = "h" Then
+        asHours = True
+        pctIn = Trim$(Left$(pctIn, Len(pctIn) - 1))
+    End If
+    pctIn = Replace(pctIn, "%", "")
+    If Not IsNumeric(pctIn) Then
+        MsgBox "Enter a number, e.g. 15 for a percentage or 64h for total hours.", _
+               vbExclamation, "Role Staffing"
+        Exit Sub
+    End If
+
+    If asHours Then
+        hrs = CDbl(pctIn)
+        If hrs <= 0 Then Exit Sub
+    Else
+        frac = CDbl(pctIn) / 100#
+        If frac <= 0 Then Exit Sub
+    End If
+
+    Set bucket = BucketFor(p, role)
+    If bucket Is Nothing Then
+        MsgBox "There's no bucket resource for " & role & ". Run RS_Setup first.", vbExclamation, "Role Staffing"
+        Exit Sub
+    End If
+
+    Application.OpenUndoTransaction "Role Staffing: add level-of-effort"
+    gRS_Suppress = gRS_Suppress + 1
+    On Error GoTo Fail
+
+    Dim spanWks As Double, note As String
+    For Each t In sel
+        If Not t Is Nothing Then
+            If Not CBool(t.Summary) Then notSummary = notSummary + 1
+
+            If asHours Then
+                ' A budget: spread it over however long this task actually spans.
+                spanWks = (t.Finish - t.Start) / 7#
+                If spanWks < 0.2 Then spanWks = 0.2
+                frac = (hrs * 60#) / (spanWks * MinutesPerWeek(p))
+                If frac > 1 Then frac = 1
+                note = note & "Task " & t.ID & ": " & Format$(hrs, "0") & " h over " & _
+                       Format$(spanWks, "0.#") & " weeks = " & Pct(frac) & " (" & _
+                       Format$(hrs / spanWks, "0.#") & " h/week)" & vbCrLf
+            End If
+
+            found = False
+            For Each a In t.Assignments
+                If a.ResourceID = bucket.ID Or StrComp(GetAsgRole(a), role, vbTextCompare) = 0 Then
+                    SetUnits a, frac
+                    updated = updated + 1
+                    found = True
+                    Exit For
+                End If
+            Next a
+            If Not found Then
+                Set a = t.Assignments.Add(ResourceID:=bucket.ID, Units:=frac)
+                SetUnits a, frac
+                SetAsgRole a, role
+                added = added + 1
+            End If
+        End If
+    Next t
+
+    gRS_Suppress = gRS_Suppress - 1
+    Application.CloseUndoTransaction
+
+    Dim msg As String
+    If asHours Then
+        msg = role & " support, " & Format$(hrs, "0") & " h spread across the span: added to " & _
+              added & " task(s), updated " & updated & "." & vbCrLf & vbCrLf & note
+    Else
+        msg = role & " support at " & Pct(frac) & ": added to " & added & " task(s), updated " & updated & "."
+    End If
+    If notSummary > 0 Then
+        msg = msg & vbCrLf & vbCrLf & notSummary & " selected task(s) weren't summary tasks, so that " & _
+              "support won't stretch automatically when the work under it moves."
+    End If
+    msg = msg & vbCrLf & "Run RS_Suggest to give the support to a person."
+    If asHours Then
+        msg = msg & vbCrLf & vbCrLf & "The rate is fixed now, so if the span changes the total " & _
+              "hours drift. Re-run this on the same task to refit them."
+    End If
+    MsgBox msg, vbInformation, "Role Staffing"
+    Exit Sub
+
+Fail:
+    FastOff
+    gRS_Suppress = gRS_Suppress - 1
+    Application.CloseUndoTransaction
+    MsgBox "Add level-of-effort failed: " & Err.Description, vbExclamation, "Role Staffing"
+End Sub
+
+' Some Project versions want a fraction, some a percentage.
+Private Sub SetUnits(a As Assignment, ByVal frac As Double)
+    a.Units = frac
+    If Abs(ToFraction(a.Units) - frac) > 0.001 Then a.Units = frac * 100
+End Sub
+
+
+'==============================================================================
+' FORWARD SCHEDULER
+'
+' Works the way Project's own auto-scheduler does, except it understands roles.
+'
+'   Walk the network in dependency order. For each task:
+'     - what role does it need?
+'     - who is authorised for it, and not ruled out by RS_RULES?
+'     - how soon could each of them actually finish it, given what they are
+'       already committed to week by week?
+'     - take the one who finishes soonest, unless someone clearly better frees
+'       up within RS_WAIT_WEEKS
+'
+' Duration falls out of WHO got the work: 16 h given to somebody with 6 h a week
+' spare takes nearly three weeks, not two days. So the schedule stretches where
+' people are thin and pulls in where they are not - independent tasks run in
+' parallel as soon as there are bodies for them.
+'
+' Compression is bounded by your LINKS, not your people: a Draft > Check > Approve
+' chain cannot be shortened by hiring checkers. Pull-in comes from independent
+' work running side by side.
+'
+' Reports only. It writes nothing to the schedule.
+'
+' Simplifications, all of them deliberate: whole weeks, finish-to-start only,
+' the project calendar's hours per week, and no resource calendars or holidays.
+'==============================================================================
+
+Public Sub RS_Schedule()
+    Dim p As Project
+    If Not HaveProject(p) Then Exit Sub
+    FastOn "scheduling forward"
+
+    Dim t As Task, a As Assignment, r As Resource
+    Dim role As String, uid As String, info As Object
+    Dim rep As New Collection, order As Collection, k As Variant
+    Dim placed As Long, unplaced As Long, latest As Long, placedN As Long
+
+    On Error GoTo Fail
+    BuildCatalog p
+    BuildRules
+    BuildRelations p
+
+    If RoleNames().Count = 0 Then
+        FastOff
+        MsgBox "No roles found. Fill in RoleAvail on the resource sheet first.", vbInformation, "Role Staffing"
+        Exit Sub
+    End If
+
+    Set mSch = NewDict()
+    Set mUse = NewDict()
+    mBase = p.ProjectStart
+
+    ' ---- collect the work -------------------------------------------------
+    For Each t In p.Tasks
+        If Not t Is Nothing Then
+            ' A hammock's dates are borrowed, not computed - placing it would
+            ' report it running for however long its hours take at the
+            ' assignee's rate, which is a different span entirely. Its capacity
+            ' is still drawn, below, across the span it actually spans.
+            If Not IsStretched(t) And ToDbl(t.Work) > 0 Then
+                role = ""
+                Set info = NewDict()
+                info("locked") = False
+                info("whoId") = 0
+                info("who") = ""
+
+                For Each a In t.Assignments
+                    Set r = ResourceOf(p, a)
+                    If Not r Is Nothing Then
+                        If IsBucket(r) Then
+                            If role = "" Then role = BucketRole(r)
+                        ElseIf r.Type = pjResourceTypeWork Then
+                            ' already staffed by hand - keep the person, just place the dates
+                            If Not info("locked") Then
+                                info("locked") = True
+                                info("whoId") = r.ID
+                                info("who") = r.Name
+                                If role = "" Then role = InferRole(a, r, t)
+                            End If
+                        End If
+                    End If
+                Next a
+                If role = "" Then role = GetTaskRole(t)
+
+                If role <> "" Then
+                    info("id") = t.ID
+                    info("name") = t.Name
+                    info("work") = ToDbl(t.Work)
+                    info("role") = role
+                    info("sWk") = -1
+                    info("fWk") = -1
+                    info("note") = ""
+                    Set mSch(CStr(t.UniqueID)) = info
+                End If
+            End If
+        End If
+    Next t
+
+    If mSch.Count = 0 Then
+        FastOff
+        MsgBox "Nothing to schedule." & vbCrLf & vbCrLf & _
+               "Tasks need work hours and a role - either a role row in Resource Names, " & _
+               "or the Role field filled in.", vbInformation, "Role Staffing"
+        Exit Sub
+    End If
+
+    ReserveStretched p, rep
+    Set order = TopoOrder(p)
+
+    ' ---- place it ---------------------------------------------------------
+    For Each k In order
+        placedN = placedN + 1
+        If (placedN Mod 10) = 0 Then Progress "task", placedN, order.Count
+        If PlaceTask(p, CStr(k)) Then
+            placed = placed + 1
+            If mSch(CStr(k))("fWk") > latest Then latest = mSch(CStr(k))("fWk")
+        Else
+            unplaced = unplaced + 1
+        End If
+    Next k
+
+    ' ---- report -----------------------------------------------------------
+    rep.Add "Scheduled forward from " & Format$(mBase, "yyyy-mm-dd") & _
+            ", in whole weeks, finish-to-start."
+    rep.Add "Waits up to " & RS_WAIT_WEEKS & " week(s) for a preferred person worth " & _
+            RS_WAIT_MARGIN & "+ more preference."
+    rep.Add "Rules: " & IIf(RulesText() = "", "(none)", RulesText())
+    rep.Add ""
+    rep.Add "WHO CAN DO WHAT, AND HOW MUCH"
+    rep.Add "------------------------------"
+    For Each k In RoleNames()
+        rep.Add "   " & PadR(CStr(k), 16) & CapacityLine(p, CStr(k))
+    Next k
+    rep.Add ""
+    rep.Add "THE SCHEDULE"
+    rep.Add "------------"
+    rep.Add "   " & PadR("task", 40) & PadR("role", 12) & PadR("who", 16) & _
+            PadR("start", 12) & PadR("finish", 12) & "note"
+    For Each k In order
+        rep.Add "   " & ScheduleLine(CStr(k))
+    Next k
+
+    rep.Add ""
+    rep.Add "RESULT"
+    rep.Add "------"
+    rep.Add "   Tasks placed:        " & placed
+    If unplaced > 0 Then rep.Add "   Tasks NOT placed:    " & unplaced & "   (see 'nobody' above)"
+    rep.Add "   Schedule starts:     " & Format$(mBase, "yyyy-mm-dd")
+    rep.Add "   Schedule finishes:   " & Format$(WeekStart(latest + 1) - 1, "yyyy-mm-dd")
+    rep.Add "   That is " & (latest + 1) & " week(s), about " & Format$((latest + 1) / 4.35, "0.#") & " months."
+    rep.Add ""
+    rep.Add "   Project's current finish: " & Format$(p.ProjectFinish, "yyyy-mm-dd")
+    rep.Add ""
+    rep.Add BottleneckLine(p)
+    rep.Add ""
+    rep.Add "The schedule itself is untouched - none of this has been applied. The only"
+    rep.Add "writes were the self-maintaining columns bringing themselves up to date"
+    rep.Add "(SpanCalc recalculating Work, hammocks re-borrowing dates, " & RS_COVERS_LABEL
+    rep.Add "re-rendering its row IDs), and those are one Undo."
+    FastOff
+    ShowReport "Forward Schedule", rep
+
+    MsgBox placed & " task(s) placed." & vbCrLf & vbCrLf & _
+           "Projected finish: " & Format$(WeekStart(latest + 1) - 1, "yyyy-mm-dd") & vbCrLf & _
+           "Project says:     " & Format$(p.ProjectFinish, "yyyy-mm-dd") & vbCrLf & vbCrLf & _
+           IIf(unplaced > 0, unplaced & " task(s) had nobody who could do them. ", "") & _
+           "The schedule is untouched - see the report.", vbInformation, "Role Staffing"
+    Exit Sub
+
+Fail:
+    FastOff
+    MsgBox "Schedule failed: " & Err.Description, vbExclamation, "Role Staffing"
+End Sub
+
+' Level-of-effort and hammocks aren't placed, but their hours are real. Draw
+' them across the span they actually cover before anything else is placed, so
+' the projection isn't optimistic by however much support has been committed.
+Private Sub ReserveStretched(p As Project, rep As Collection)
+    Dim t As Task, a As Assignment, r As Resource
+    Dim wks As Long, first As Long, last As Long, perWk As Double, i As Long
+    Dim held As Long, unstaffed As Long
+
+    For Each t In p.Tasks
+        If Not t Is Nothing Then
+            If IsStretched(t) And ToDbl(t.Work) > 0 Then
+                first = WeekOf(t.Start)
+                last = WeekOf(t.Finish)
+                If last < first Then last = first
+                wks = last - first + 1
+
+                For Each a In t.Assignments
+                    Set r = ResourceOf(p, a)
+                    If Not r Is Nothing Then
+                        If IsWorkPerson(r) Then
+                            ' Each assignment's OWN hours, not the task's. This
+                            ' read the task total and then reserved it once per
+                            ' assignment, so sharing a 64-hour span across four
+                            ' people reserved 256 hours of their time instead of
+                            ' 64 - and the more sensibly you spread the work, the
+                            ' further the schedule was pushed out. Project has
+                            ' already divided Work across the assignments; a.Work
+                            ' is that share.
+                            perWk = ToDbl(a.Work) / wks
+                            If perWk <= 0 Then perWk = ToDbl(t.Work) / wks / _
+                                                       t.Assignments.Count
+                            For i = first To last
+                                mUse(r.ID & "|" & i) = ToDbl(mUse(r.ID & "|" & i)) + perWk
+                            Next i
+                            held = held + 1
+                        ElseIf IsBucket(r) Then
+                            unstaffed = unstaffed + 1
+                        End If
+                    End If
+                Next a
+            End If
+        End If
+    Next t
+
+    If held > 0 Or unstaffed > 0 Then
+        rep.Add "SUPPORT SPREAD ACROSS A SPAN"
+        rep.Add "-----------------------------"
+        rep.Add "   " & held & " staffed - their hours are reserved week by week before"
+        rep.Add "           anything else is placed, so the dates below account for them."
+        If unstaffed > 0 Then
+            rep.Add "   " & unstaffed & " still on a role row - nobody to reserve against, so the"
+            rep.Add "           dates below are optimistic by that much. Staff them and re-run."
+        End If
+        rep.Add ""
+    End If
+End Sub
+
+' Dependency order, falling back to ID order for anything left over (cycles,
+' links we can't resolve).
+Private Function TopoOrder(p As Project) As Collection
+    Dim out As New Collection, done As Object, guard As Long
+    Dim k As Variant, t As Task, pre As Task, ready As Boolean, added As Long
+
+    Set done = NewDict()
+    Do
+        added = 0
+        For Each k In mSch.Keys
+            If Not done.Exists(CStr(k)) Then
+                ready = True
+                Set t = TaskByUid(p, CLng(k))
+                If Not t Is Nothing Then
+                    On Error Resume Next
+                    For Each pre In t.PredecessorTasks
+                        If Not pre Is Nothing Then
+                            If mSch.Exists(CStr(pre.UniqueID)) And Not done.Exists(CStr(pre.UniqueID)) Then
+                                ready = False
+                            End If
+                        End If
+                    Next pre
+                    On Error GoTo 0
+                End If
+                If ready Then
+                    out.Add CStr(k)
+                    done(CStr(k)) = True
+                    added = added + 1
+                End If
+            End If
+        Next k
+        guard = guard + 1
+    Loop While added > 0 And done.Count < mSch.Count And guard < 200
+
+    For Each k In mSch.Keys          ' anything circular, in whatever order
+        If Not done.Exists(CStr(k)) Then out.Add CStr(k)
+    Next k
+    Set TopoOrder = out
+End Function
+
+' The week a task could start: after everything upstream.
+Private Function EarliestWeek(p As Project, ByVal key As String) As Long
+    EarliestWeek = PredFinish(p, key, 0)
+End Function
+
+' A task we didn't schedule - a milestone, a review gate, anything with no work
+' or no role - must not stop the chain. Without this, Draft > [milestone] >
+' Check reads the milestone's CURRENT date and the check never moves, however
+' far the drafting slipped.
+'
+' We take the later of the gate's own date and whatever feeds it, so a genuine
+' fixed date still holds but a slip still propagates through it.
+Private Function PredFinish(p As Project, ByVal key As String, ByVal depth As Long) As Long
+    Dim pre As Task, wk As Long, w As Long, up As Long, pk As Variant
+    If depth > RS_MAX_LINK_DEPTH Then Exit Function
+
+    On Error Resume Next
+    For Each pk In PredsOf(key)
+        If mSch.Exists(CStr(pk)) Then
+            w = ToDbl(mSch(CStr(pk))("fWk")) + 1                    ' finish-to-start
+        Else
+            Set pre = TaskByUid(p, CLng(pk))
+            w = 0
+            If Not pre Is Nothing Then w = WeekOf(pre.Finish) + 1   ' its own date...
+            up = PredFinish(p, CStr(pk), depth + 1)                 ' ...or its feeders
+            If up > w Then w = up
+        End If
+        If w > wk Then wk = w
+    Next pk
+    On Error GoTo 0
+    PredFinish = wk
+End Function
+
+' Pick somebody and place the task. False if nobody can do it.
+Private Function PlaceTask(p As Project, ByVal key As String) As Boolean
+    Dim info As Object, role As String, work As Double, earliest As Long
+    Dim r As Resource, best As Long, bestFin As Long, bestStart As Long
+    Dim bestScore As Double, bestName As String, note As String
+    Dim fin As Long, st As Long, sc As Double, soonest As Long
+    Dim cands As Collection, c As Variant, anyCand As Boolean
+
+    Set info = mSch(key)
+    role = CStr(info("role"))
+    work = ToDbl(info("work"))
+    earliest = EarliestWeek(p, key)
+
+    Set cands = New Collection
+
+    If CBool(info("locked")) Then
+        ' already staffed by hand - no choice to make, just place the dates
+        Set r = Nothing
+        On Error Resume Next
+        Set r = p.Resources(CLng(info("whoId")))
+        On Error GoTo 0
+        If r Is Nothing Then Exit Function
+        st = Simulate(r.ID, RoleRate(r, role), TotalCapacity(r), earliest, work, fin)
+        If st < 0 Then Exit Function
+        CommitDraw r.ID, RoleRate(r, role), TotalCapacity(r), earliest, work
+        AddTentative CLng(key), r.ID, role
+        info("sWk") = st
+        info("fWk") = fin
+        info("note") = "kept (already assigned)"
+        PlaceTask = True
+        Exit Function
+    End If
+
+    For Each r In People()
+        If True Then
+            If HasRole(r, role) Then
+                If FindConflict(CLng(key), r.ID, role) = "" Then
+                    If RoleRate(r, role) > 0 Then
+                        st = Simulate(r.ID, RoleRate(r, role), TotalCapacity(r), earliest, work, fin)
+                        If st >= 0 Then
+                            sc = W_PREFERENCE * RoleShare(r, role)
+                            If IsPrimaryFor(r, role) Then sc = sc + W_PRIMARY
+                            cands.Add Array(r.ID, r.Name, st, fin, sc)
+                            If Not anyCand Then
+                                soonest = fin
+                                anyCand = True
+                            ElseIf fin < soonest Then
+                                soonest = fin
+                            End If
+                        End If
+                    End If
+                End If
+            End If
+        End If
+    Next r
+
+    If Not anyCand Then
+        info("note") = "nobody authorised and free"
+        Exit Function
+    End If
+
+    ' Soonest finish wins, unless someone clearly better is worth a short wait.
+    bestFin = -1
+    For Each c In cands
+        If CLng(c(3)) <= soonest + RS_WAIT_WEEKS Then
+            If bestFin < 0 Or CDbl(c(4)) > bestScore + 0.0001 Then
+                best = CLng(c(0))
+                bestName = CStr(c(1))
+                bestStart = CLng(c(2))
+                bestFin = CLng(c(3))
+                bestScore = CDbl(c(4))
+            End If
+        End If
+    Next c
+
+    ' If the wait didn't buy a materially better person, take the soonest - and
+    ' among those tied at the soonest finish, the one we'd rather have. Taking
+    ' the first match would hand it to whoever happens to sit highest in the
+    ' resource sheet.
+    Dim tieId As Long, tieName As String, tieStart As Long, tieScore As Double, tieAny As Boolean
+    For Each c In cands
+        If CLng(c(3)) = soonest Then
+            If Not tieAny Or CDbl(c(4)) > tieScore Then
+                tieId = CLng(c(0))
+                tieName = CStr(c(1))
+                tieStart = CLng(c(2))
+                tieScore = CDbl(c(4))
+                tieAny = True
+            End If
+        End If
+    Next c
+    If tieAny Then
+        If bestScore - tieScore < RS_WAIT_MARGIN Then
+            best = tieId
+            bestName = tieName
+            bestStart = tieStart
+            bestFin = soonest
+            bestScore = tieScore
+        End If
+    End If
+
+    Set r = Nothing
+    On Error Resume Next
+    Set r = p.Resources(best)
+    On Error GoTo 0
+    If r Is Nothing Then Exit Function
+
+    CommitDraw best, RoleRate(r, role), TotalCapacity(r), earliest, work
+
+    ' Tell the relations map, or the next task never learns this person did
+    ' this work - and a drafter would sail straight through to checking it.
+    AddTentative CLng(key), best, role
+
+    info("whoId") = best
+    info("who") = bestName
+    info("sWk") = bestStart
+    info("fWk") = bestFin
+
+    note = ""
+    If bestStart > earliest Then note = "waited " & (bestStart - earliest) & "wk for capacity"
+
+    ' Stretched = it spans more weeks than this person's own rate would need,
+    ' i.e. their time was being shared with something else.
+    Dim needWks As Long, rate As Double
+    rate = RoleRate(r, role)
+    If rate > 0 Then
+        needWks = Int(work / rate)
+        If work > needWks * rate + 0.01 Then needWks = needWks + 1
+        If needWks < 1 Then needWks = 1
+        If (bestFin - bestStart + 1) > needWks Then
+            If note <> "" Then note = note & "; "
+            note = note & "spread over " & (bestFin - bestStart + 1) & "wk (needs " & _
+                   needWks & "wk of " & bestName & "'s time)"
+        End If
+    End If
+    info("note") = note
+    PlaceTask = True
+End Function
+
+' Walk forward consuming this person's free time. Returns the start week, or -1.
+' rate  = what this person can give THIS role per week (Max Units x share)
+' cap   = their whole week, across everything
+Private Function Simulate(ByVal resId As Long, ByVal rate As Double, ByVal cap As Double, _
+                          ByVal fromWk As Long, ByVal work As Double, ByRef finWk As Long) As Long
+    Dim wk As Long, remaining As Double, free As Double, st As Long
+    st = -1
+    remaining = work
+    wk = fromWk
+    Do While remaining > 0.01 And wk < fromWk + RS_MAX_WEEKS
+        free = MinD(rate, cap - ToDbl(mUse(resId & "|" & wk)))
+        If free > 0.01 Then
+            If st < 0 Then st = wk
+            remaining = remaining - MinD(remaining, free)
+        End If
+        wk = wk + 1
+    Loop
+    If remaining > 0.01 Then
+        Simulate = -1
+    Else
+        finWk = wk - 1
+        Simulate = st
+    End If
+End Function
+
+Private Sub CommitDraw(ByVal resId As Long, ByVal rate As Double, ByVal cap As Double, _
+                       ByVal fromWk As Long, ByVal work As Double)
+    Dim wk As Long, remaining As Double, free As Double, draw As Double
+    remaining = work
+    wk = fromWk
+    Do While remaining > 0.01 And wk < fromWk + RS_MAX_WEEKS
+        free = MinD(rate, cap - ToDbl(mUse(resId & "|" & wk)))
+        If free > 0.01 Then
+            draw = MinD(remaining, free)
+            mUse(resId & "|" & wk) = ToDbl(mUse(resId & "|" & wk)) + draw
+            remaining = remaining - draw
+        End If
+        wk = wk + 1
+    Loop
+End Sub
+
+Private Function ScheduleLine(ByVal key As String) As String
+    Dim i As Object, who As String
+    Set i = mSch(key)
+    who = CStr(i("who"))
+    If who = "" Then who = "-- nobody --"
+    If ToDbl(i("sWk")) < 0 Then
+        ScheduleLine = PadR(Left$(CStr(i("id")) & " " & CStr(i("name")), 39), 40) & _
+                       PadR(CStr(i("role")), 12) & PadR(who, 16) & _
+                       PadR("-", 12) & PadR("-", 12) & CStr(i("note"))
+    Else
+        ScheduleLine = PadR(Left$(CStr(i("id")) & " " & CStr(i("name")), 39), 40) & _
+                       PadR(CStr(i("role")), 12) & PadR(who, 16) & _
+                       PadR(Format$(WeekStart(CLng(i("sWk"))), "yyyy-mm-dd"), 12) & _
+                       PadR(Format$(WeekStart(CLng(i("fWk")) + 1) - 1, "yyyy-mm-dd"), 12) & _
+                       CStr(i("note"))
+    End If
+End Function
+
+Private Function CapacityLine(p As Project, ByVal role As String) As String
+    Dim r As Resource, n As Long, mins As Double, s As String
+    For Each r In p.Resources
+        If IsWorkPerson(r) Then
+            If HasRole(r, role) Then
+                n = n + 1
+                mins = mins + RoleRate(r, role)
+                If s <> "" Then s = s & ", "
+                s = s & r.Name & " " & Format$(RoleRate(r, role) / 60, "0.#") & "h/wk when on it"
+                If RoleShare(r, role) > 0 Then s = s & " (share " & Pct(RoleShare(r, role)) & ")"
+                If IsPrimaryFor(r, role) Then s = s & "*"
+            End If
+        End If
+    Next r
+    If n = 0 Then
+        CapacityLine = "NOBODY - any task needing this can't be scheduled"
+    Else
+        CapacityLine = PadL(Format$(mins / 60, "0") & " h/wk", 9) & " across " & n & _
+                       " person(s):  " & s
+    End If
+End Function
+
+' Which role is holding the whole thing up.
+Private Function BottleneckLine(p As Project) As String
+    Dim k As Variant, dem As Object, r As Resource, x As Variant
+    Dim cap As Double, worst As String, worstWks As Double, wks As Double
+
+    Set dem = NewDict()
+    For Each k In mSch.Keys
+        dem(CStr(mSch(k)("role"))) = ToDbl(dem(CStr(mSch(k)("role")))) + ToDbl(mSch(k)("work"))
+    Next k
+
+    For Each x In RoleNames()
+        cap = 0
+        For Each r In p.Resources
+            If IsWorkPerson(r) Then
+                If HasRole(r, CStr(x)) Then cap = cap + TotalCapacity(r)
+            End If
+        Next r
+        If cap > 0 And ToDbl(dem(CStr(x))) > 0 Then
+            wks = ToDbl(dem(CStr(x))) / cap
+            If wks > worstWks Then
+                worstWks = wks
+                worst = CStr(x)
+            End If
+        End If
+    Next x
+
+    If worst = "" Then
+        BottleneckLine = "   No bottleneck worked out."
+    Else
+        BottleneckLine = "   Tightest role: " & worst & " - " & Format$(worstWks, "0.#") & _
+                         " week(s) of work even if everyone who can do it does nothing else." & vbCrLf & _
+                         "   That is the floor on this project, whatever the links look like."
+    End If
+End Function
+
+Private Function WeekOf(ByVal d As Date) As Long
+    If d <= mBase Then Exit Function
+    WeekOf = Int((d - mBase) / 7)
+End Function
+
+Private Function WeekStart(ByVal wk As Long) As Date
+    WeekStart = mBase + (wk * 7)
+End Function

@@ -1,0 +1,1908 @@
+Option Explicit
+'==============================================================================
+' ROLE STAFFING FOR MS PROJECT   -   core module
+'
+' Answers one question: how long will this actually take, given who is available
+' to do what?
+'
+' This module holds the config, the role catalogue, the rules engine, field
+' access, the relations between tasks, weekly load, and the shared helpers.
+' Import it FIRST - the other three lean on the state it keeps.
+'
+'   RoleStaffing    this file
+'   RS_TaskData     SameWorkAs, hammock tasks, SpanCalc, backfill, pre-flight
+'   RS_Level        suggest, apply, unstaff, level, level-of-effort, scheduler
+'   RS_UI           menu, setup check, panel, ribbon, reports
+'   clsRS_AppEvents the manual-edit guard (a Class Module)
+'
+' The CONFIG block below is the only part you would normally edit.
+'
+'
+' THE MODEL
+'
+'   Max Units       The ONE hard constraint: what a person can really give this
+'                   project. 40% is two days a week. Nothing may exceed it, and
+'                   it's what Project's own leveller and its overallocation
+'                   markers understand - which is why levelling is driven here
+'                   rather than reinvented.
+'
+'   RoleAvail       "Check:40*,Approve:40,Engineer:10,Draft:10"
+'                   Authority AND preference in one column. Listed at all means
+'                   allowed; not listed means never, and they won't even appear
+'                   as a candidate. The number is preference among the roles
+'                   they ARE allowed - soft, so if there's no Approve work that
+'                   time lends to the others. A trailing * means it's their job,
+'                   which beats raw availability. "Check:0" is allowed but last
+'                   resort.
+'
+'   IsRole          Marks a resource row as a bucket: unstaffed demand rather
+'                   than a person. Assign one to a task to say "this needs a
+'                   checker". Name the row whatever you like.
+'
+' Roles are discovered from the resource sheet, never hardcoded. Add one by
+' typing it in somebody's RoleAvail.
+'
+'
+' THE COLUMNS
+'
+' Found by NAME, anywhere in Text1..Text30 - rename any spare field to one of
+' these in Project > Custom Fields and it's picked up there. No fallback field
+' number: a label nothing carries means that feature is simply off. RS_Check
+' lists what's missing and fixes only what you pick.
+'
+'   Role            Task row: what kind of work this is.
+'                   Assignment row: the role that person fills.
+'                   Same column, two meanings, told apart by the indent.
+'   SameWorkAs      Which task is the same piece of work as this one - the
+'                   relationship the rules turn on. Type ROW IDs, the numbers on
+'                   screen; they're stored as Unique IDs and redisplayed, so they
+'                   follow the tasks when rows move, like Predecessors does.
+'                   Carries along a chain: Draft > Check > Approve.
+'   Suggested       The person RS_Suggest picked, for review before RS_Apply.
+'   Spans           Borrow another task's dates so this one lasts exactly as
+'                   long - a hammock. For support spread across a deliverable.
+'   SpanCalc        Work as a formula: =(#20 * 0.20) + (#11 * 0.05)
+'                   #20 is the hours on row 20. Recalculated on every run.
+'   three internal  Scratch the code writes and reads back.
+'
+'   Assignment Notes    why that person was suggested.
+'
+'
+' THE RULES
+'
+'   RS_RULES = "Draft&!Check"   whoever drafts may not check the same work.
+'
+' Roles are arbitrary; so is the number of rules. "Same work" means the same
+' task, or one reached through SameWorkAs, or found by walking predecessor links
+' back to it. Rules are symmetric - it makes no difference which end you staff
+' first.
+'==============================================================================
+
+
+'==============================================================================
+' CONFIG
+'==============================================================================
+
+' Who may not do what, on the same work.
+'   "Draft&!Check"              a drafter may not check their own work
+'   "Draft&!Check;Check&!Approve"  ...and a checker may not approve it
+'   "Draft&!Check&!Approve"     a drafter may neither check nor approve it
+' Rules are symmetric: it does not matter which end you assign first.
+' Roles NOT named in any rule are transparent to the link walk (a Redline
+' rework task between Draft and Check does not hide the drafting).
+Public Const RS_RULES As String = "Draft&!Check"
+
+' How many predecessor links to walk back looking for the related work.
+Public Const RS_MAX_LINK_DEPTH As Long = 8
+
+' Scoring.  score = preference + primary bonus
+'                   - over-capacity penalty      (their real Max Units: firm)
+'                   - drift penalty              (past their role share: soft)
+'                   + headroom bonus
+Public Const W_PREFERENCE As Double = 100   ' x their share for this role
+Public Const W_PRIMARY As Double = 25       ' the * in "Check:40*"
+Public Const W_OVER_MAX As Double = 120     ' firm: beyond real availability
+Public Const W_DRIFT As Double = 25         ' soft: beyond their role share
+Public Const W_HEADROOM As Double = 15      ' spare capacity left afterwards
+
+' Bucket rows get inflated Max Units so unstaffed demand never reads as
+' an overallocated person.
+Public Const RS_BUCKET_UNITS As Double = 10
+
+' ---- What units to give a person when RS_Apply staffs them -------------------
+' A person works one task at a time, at the rate they are available: Bob at
+' 80% Max Units drafts at 80% - 6.4 h of an 8 h day - so a 10 h task takes 1.56
+' days, not 1.25. It stretches.
+'
+' The RoleAvail share is NOT a rate limit on a single task. "Engineer:50" does
+' not mean Jane crawls at half speed; it means engineering gets about half of
+' his time across the project. It decides WHICH work he gets, not how fast he
+' does it. Rate is his Max Units.
+'
+' 1  units = the person's Max Units. What you want. (default)
+' 2  units = Max Units x share - i.e. Jane at Engineer:50 and 40% available is
+'    assigned at 20%, crawling along while most of him sits idle. Only useful if
+'    somebody genuinely splits a day across several roles at once.
+' 0  leave units alone. A 100% slot given to an 80% person leaves them over on
+'    that one task by themselves, and levelling CANNOT fix that - there is no
+'    collision to delay, just an assignment bigger than the person. This is what
+'    fills a resource sheet with red that levelling never clears.
+'
+' Modes 1 and 2 both need Fixed Work (or Fixed Units + effort-driven) tasks. On
+' Fixed Duration, Project changes Work instead of dates and nothing stretches -
+' RS_Apply measures this and tells you.
+Public Const RS_UNITS_MODE As Long = 1
+
+' ---- Column labels the code looks for ----------------------------------------
+' The code finds a column by its NAME, anywhere in Text1..Text30. Rename a field
+' to one of these in Project > Custom Fields > Task and it's picked up wherever
+' you put it - Text3 or Text27 makes no difference.
+'
+' There is NO fallback field number. A label nothing is named simply isn't
+' available, and the feature behind it stays off until you name one. Guessing at
+' a field number would sooner or later read and write somebody else's data.
+'
+' (Project gives tasks Text1..Text30. There is no Text46.)
+Public Const RS_L_ROLE As String = "Role"
+Public Const RS_L_SAMEWORK As String = "SameWorkAs"
+Public Const RS_L_SUGGESTED As String = "Suggested"
+Public Const RS_L_SPANS As String = "Spans"
+Public Const RS_L_CALC As String = "SpanCalc"
+
+' Scratch the code writes and reads back. Name three spare fields after these
+' and the features needing them work; leave them and those features are off.
+Public Const RS_L_UNITSTASH As String = "RS units (internal)"
+Public Const RS_L_SWSTASH As String = "RS samework (internal)"
+Public Const RS_L_SPANSTASH As String = "RS spans (internal)"
+
+' ---- What the hammock column is called ---------------------------------------
+' A task that borrows another task's dates so it lasts exactly as long - the
+' industry term is a hammock task. "Spans" says what it does without needing the
+' jargon; "Hammock" is fine if that's the word your team uses. Label only, the
+' data is Task Text8 either way.
+Public Const RS_SPANS_LABEL As String = RS_L_SPANS
+
+' ---- What the "same work" column is called -----------------------------------
+' Just the column label - change it and re-run RS_Setup. The data is in Task
+' Text4 whatever it's called, so renaming loses nothing.
+'
+' It answers: which task is the SAME PIECE OF WORK as this one? That is the
+' relationship the rules turn on - the same person can't draft and check one
+' piece of work. Avoid "Requires": that reads as a scheduling dependency, which
+' is what Predecessors already is.
+Public Const RS_COVERS_LABEL As String = RS_L_SAMEWORK
+
+' ---- What a number in that column means ---------------------------------------
+' True   a bare number is the ID column - the row number you can see. Easier to
+'        type and check, but row IDs SHIFT when tasks are inserted, deleted or
+'        moved, and a shifted one silently points at a different task. Re-run
+'        RS_RuleLinks after reordering and read what it says each entry covers.
+' False  a bare number is the Unique ID, which never changes but isn't shown
+'        unless you add the column.
+'
+' Either way you can be explicit per entry:  #33 is a row ID, u47 is a Unique ID.
+Public Const RS_COVERS_BY_ROW_ID As Boolean = True
+
+' ---- RS_PrepFile --------------------------------------------------------------
+' PjTaskFixedType values, as literals: naming the enum would be compile-checked,
+' and one wrong constant stops the whole module (see pjStandard).
+Public Const PJ_FIXED_UNITS As Long = 0
+Public Const PJ_FIXED_DURATION As Long = 1
+Public Const PJ_FIXED_WORK As Long = 2
+
+' ---- Forward scheduler (RS_Schedule) ----------------------------------------
+' When the person you'd rather have is busy, how long will it wait for them
+' before handing the work to someone who is free now? 0 = always take whoever
+' finishes soonest. Higher = protect the preferred assignment at the cost of
+' calendar time.
+Public Const RS_WAIT_WEEKS As Long = 1
+
+' How much better a candidate has to be, on preference score, to be worth
+' waiting for at all.
+Public Const RS_WAIT_MARGIN As Double = 15
+
+' Runaway guard: a task that can't be placed inside this many weeks is reported
+' rather than looped on.
+Public Const RS_MAX_WEEKS As Long = 520
+
+
+'==============================================================================
+' GLOBALS
+'==============================================================================
+
+Public gRS_Suppress As Long          ' > 0 while our own macros edit things
+Public gRS_GuardOn As Boolean
+Public gRS_PendingTags As Object     ' assignment UID -> role, written later
+Public gRS_Auto As Boolean           ' True while RS_AutoStaff drives the whole run
+Public gRS_Applied As Long           ' how many RS_Apply staffed, for the auto summary
+Public gRS_Before As Date            ' finish dates either side of levelling
+Public gRS_After As Date
+Public gRS_Moved As Long
+Public gRS_RibbonChecked As Boolean   ' ribbon looked at once this session
+Public gRS_CalcSeen As Long           ' ProjectCalculate events, for RS_EventTest
+Public gRS_CoversCleared As Long      ' SameWorkAs entries the last sync threw out
+Public gRS_FormRows As Collection     ' rows the RoleAvail form is editing
+Public gRS_FormResId As Long          ' the person it's editing them for
+Public gRS_RowBtns As Collection      ' keeps runtime row-button handlers alive
+
+Public mEvents As clsRS_AppEvents
+' Named RS_FORM_* rather than RS_PANEL/RS_CHECKFORM: VBA identifiers are
+' case-insensitive, so a constant RS_CHECKFORM and a macro RS_CheckForm are the
+' SAME name, and the constant loses. That reads as "expected function or
+' variable" at the point the constant is used.
+Public Const RS_FORM_PANEL As String = "frmRoleStaffing"    ' the generated control panel
+Public Const RS_FORM_CHECK As String = "frmRSCheck"    ' the generated setup-check form
+Public Const RS_FORM_ROLES As String = "frmRSRoles"     ' the generated RoleAvail form
+Public Const RS_DEAD As String = "zzRSGone"    ' parked name for a form on its way out
+
+' Which context menus to add "Edit RoleAvail..." to, as customUI idMso names.
+' Microsoft doesn't publish Project's, so these are educated guesses - if you
+' find the real one, put it here. Empty string writes no context menus at all.
+Public Const RS_CTX_MENUS As String = "ContextMenuResource,ContextMenuResourceSheet," & _
+                                      "ContextMenuResourceName,ContextMenuResourceUsage"
+
+' Role catalogue
+Public mRoles As Object             ' ROLE -> proper-case name
+Public mSkills As Object            ' resId -> dict(ROLE -> Array(share, primary))
+Public mPeople As Collection        ' work people, cached per run
+Public mCap As Object               ' resId -> minutes per week
+Public mCoverUids As Object         ' uids any SameWorkAs points at
+Public mCoverFp As String           ' where those sat last time we looked
+Public mCoverScanned As String      ' project we've indexed SameWorkAs for
+
+' Which field number each label turned out to be
+Public mF_Role As Long
+Public mF_SameWork As Long
+Public mF_Suggested As Long
+Public mF_Spans As Long
+Public mF_Calc As Long
+Public mF_UnitStash As Long
+Public mF_SwStash As Long
+Public mF_SpanStash As Long
+Public mF_Found As String
+
+' SpanCalc expression parser
+Public mCalcSrc As String           ' expression being parsed
+Public mCalcPos As Long             ' how far through it we are
+Public mCalcBad As String           ' why it failed, if it did
+Public mCalcProj As Project
+Public mResUid As Object            ' resource UniqueID -> Resource
+Public mResName As Object           ' lowercased name -> Resource
+Public mTaskUid As Object           ' task UniqueID -> Task
+Public mPreds As Object             ' task UniqueID -> Collection of predecessor UIDs
+Public mPplMemo As Object           ' "uid|ROLE" -> dict of resId, cleared on change
+
+' Rules
+Public mRules As Collection         ' Array(triggerRole, dict of forbidden roles)
+Public mRuleRoles As Object         ' ROLE -> True for every role named in a rule
+
+' Relations
+Public mTasks As Object             ' uid -> dict(id, name, summary, roles, people)
+Public mUp As Object                ' uid -> dict(upstream uid -> True)
+Public mDown As Object              ' uid -> dict(downstream uid -> True)
+Public mCoverKind As Object         ' uid -> "Links" | "SameWorkAs"
+Public mProblems As Object          ' uid -> Collection of strings
+Public mProject As Project
+
+' Load
+Public mRoleLoad As Object          ' "resId|ROLE|week" -> minutes
+Public mTotalLoad As Object         ' "resId|week"      -> minutes
+Public mOpenLoad As Object          ' "ROLE|week"       -> minutes (unstaffed)
+Public mWeeks As Object             ' week -> True
+Public mMinPerWeek As Double
+
+' Forward scheduler (RS_Schedule)
+Public mSch As Object               ' uid -> dict(id,name,work,role,who,whoId,sWk,fWk,note,locked)
+Public mUse As Object               ' "resId|week" -> minutes committed
+Public mBase As Date                ' week 0 starts here
+
+' Speed
+Public mFastDepth As Long           ' nesting depth of FastOn/FastOff
+Public mPrevScreen As Boolean       ' ScreenUpdating as we found it
+Public mWWCache As Object           ' assignment UID -> weekly work, for one run
+
+
+'==============================================================================
+' ROLE CATALOGUE
+' Roles are whatever appears in RoleAvail or IsRole. Nothing is hardcoded.
+'==============================================================================
+
+Public Sub BuildCatalog(p As Project)
+    Dim r As Resource, d As Object, k As Variant, s As String
+
+    Set mRoles = NewDict()
+    Set mSkills = NewDict()
+    Set mPeople = New Collection
+    Set mCap = NewDict()
+    Set mResUid = NewDict()
+    Set mResName = NewDict()
+
+    ' TotalCapacity needs this. It used to be set only by BuildLoad, so anything
+    ' that skipped BuildLoad - RS_Schedule did - saw every person as having zero
+    ' capacity and rejected every candidate.
+    mMinPerWeek = MinutesPerWeek(p)
+    ResolveFields
+
+    For Each r In p.Resources
+        If Not r Is Nothing Then
+            s = Trim$(r.Text2)                        ' IsRole
+            If s <> "" Then NoteRole s
+
+            Set d = ParseRoleAvail(Trim$(r.Text1))    ' RoleAvail
+            If d.Count > 0 Then
+                Set mSkills(CStr(r.ID)) = d
+                For Each k In d.Keys
+                    NoteRole CStr(d(k)(2))
+                Next k
+            End If
+
+            ' Cache the people and their capacity once. Every property read here
+            ' is a COM call, and these were being re-read for every candidate of
+            ' every task.
+            If s = "" And r.Type = pjResourceTypeWork Then
+                mPeople.Add r
+                mCap(CStr(r.ID)) = ToFraction(r.MaxUnits) * mMinPerWeek
+            End If
+            Set mResUid(CStr(r.UniqueID)) = r
+            Set mResName(LCase$(Trim$(r.Name))) = r
+        End If
+    Next r
+End Sub
+
+' Work people, cached. Use this instead of walking p.Resources in a loop.
+Public Function People() As Collection
+    If mPeople Is Nothing Then Set mPeople = New Collection
+    Set People = mPeople
+End Function
+
+Private Sub NoteRole(ByVal s As String)
+    s = Trim$(s)
+    If s = "" Then Exit Sub
+    If Not mRoles.Exists(UCase$(s)) Then mRoles(UCase$(s)) = s
+End Sub
+
+' "Check:40*, Draft:20" -> dict UCASE(role) -> Array(share 0..1, isPrimary, properName)
+' Accepts ':' '-' or a space before the number. Parses from the LAST separator,
+' so role names may contain hyphens ("Redline-Support:20").
+Public Function ParseRoleAvail(ByVal avail As String) As Object
+    Dim d As Object, parts As Variant, x As Variant, s As String
+    Dim nm As String, num As String, i As Long, prim As Boolean, v As Double
+
+    Set d = NewDict()
+    avail = Replace(Replace(avail, ";", ","), "|", ",")
+    parts = Split(avail, ",")
+
+    For Each x In parts
+        s = Trim$(CStr(x))
+        If s <> "" Then
+            prim = False
+            If Right$(s, 1) = "*" Then
+                prim = True
+                s = Trim$(Left$(s, Len(s) - 1))
+            End If
+
+            i = LastSepPos(s)
+            If i > 0 Then
+                nm = Trim$(Left$(s, i - 1))
+                num = Trim$(Mid$(s, i + 1))
+            Else
+                nm = s
+                num = ""
+            End If
+
+            If nm <> "" Then
+                v = ToDbl(Replace(num, "%", ""))
+                If num = "" Then v = 100            ' "Check" alone means Check:100
+                v = MaxD(0, v) / 100#
+                d(UCase$(nm)) = Array(v, prim, nm)
+            End If
+        End If
+    Next x
+
+    Set ParseRoleAvail = d
+End Function
+
+Private Function LastSepPos(ByVal s As String) As Long
+    Dim i As Long, c As String
+    For i = Len(s) To 1 Step -1
+        c = Mid$(s, i, 1)
+        If c = ":" Or c = "-" Or c = " " Then
+            LastSepPos = i
+            Exit Function
+        End If
+    Next i
+End Function
+
+Public Function RoleNames() As Collection
+    Dim c As New Collection, k As Variant
+    If Not mRoles Is Nothing Then
+        For Each k In mRoles.Keys
+            c.Add mRoles(k)
+        Next k
+    End If
+    Set RoleNames = c
+End Function
+
+Public Function NormalizeRole(ByVal s As String) As String
+    s = Trim$(s)
+    If s = "" Then Exit Function
+    If mRoles Is Nothing Then Exit Function
+    If mRoles.Exists(UCase$(s)) Then NormalizeRole = mRoles(UCase$(s))
+End Function
+
+Public Function RoleShare(r As Resource, ByVal role As String) As Double
+    Dim d As Object
+    If mSkills Is Nothing Then Exit Function
+    If Not mSkills.Exists(CStr(r.ID)) Then Exit Function
+    Set d = mSkills(CStr(r.ID))
+    If d.Exists(UCase$(role)) Then RoleShare = CDbl(d(UCase$(role))(0))
+End Function
+
+Public Function IsPrimaryFor(r As Resource, ByVal role As String) As Boolean
+    Dim d As Object
+    If mSkills Is Nothing Then Exit Function
+    If Not mSkills.Exists(CStr(r.ID)) Then Exit Function
+    Set d = mSkills(CStr(r.ID))
+    If d.Exists(UCase$(role)) Then IsPrimaryFor = CBool(d(UCase$(role))(1))
+End Function
+
+' Listed in RoleAvail at all = they are ALLOWED to do it. Not listed = they
+' can't, full stop - they never even appear as a candidate. The number is
+' preference among the roles they are allowed to do, and "Check:0" is valid:
+' allowed, but last resort.
+Public Function HasRole(r As Resource, ByVal role As String) As Boolean
+    If mSkills Is Nothing Then Exit Function
+    If Not mSkills.Exists(CStr(r.ID)) Then Exit Function
+    HasRole = mSkills(CStr(r.ID)).Exists(UCase$(role))
+End Function
+
+Public Function RoleCount(r As Resource) As Long
+    If mSkills Is Nothing Then Exit Function
+    If mSkills.Exists(CStr(r.ID)) Then RoleCount = mSkills(CStr(r.ID)).Count
+End Function
+
+Public Function OnlyRole(r As Resource) As String
+    Dim d As Object, k As Variant
+    If RoleCount(r) <> 1 Then Exit Function
+    Set d = mSkills(CStr(r.ID))
+    For Each k In d.Keys
+        OnlyRole = CStr(d(k)(2))
+    Next k
+End Function
+
+
+'==============================================================================
+' RULES ENGINE
+' "Draft&!Check;Check&!Approve"  ->  who may not do what, on the same work.
+'==============================================================================
+
+Public Sub BuildRules()
+    Dim rules As Variant, one As Variant, toks As Variant, tk As Variant
+    Dim trig As String, forb As Object, s As String, first As Boolean
+
+    Set mRules = New Collection
+    Set mRuleRoles = NewDict()
+
+    rules = Split(Replace(RS_RULES, ",", ";"), ";")
+    For Each one In rules
+        s = Trim$(CStr(one))
+        If s <> "" Then
+            toks = Split(s, "&")
+            trig = ""
+            Set forb = NewDict()
+            first = True
+            For Each tk In toks
+                s = Trim$(CStr(tk))
+                If s <> "" Then
+                    If Left$(s, 1) = "!" Then
+                        s = Trim$(Mid$(s, 2))
+                        If s <> "" Then
+                            forb(UCase$(s)) = s
+                            mRuleRoles(UCase$(s)) = True
+                        End If
+                    ElseIf first Then
+                        trig = s
+                        mRuleRoles(UCase$(s)) = True
+                    End If
+                    first = False
+                End If
+            Next tk
+            If trig <> "" And forb.Count > 0 Then mRules.Add Array(trig, forb)
+        End If
+    Next one
+End Sub
+
+' A role nobody wrote a rule about is transparent to the link walk.
+Private Function IsRuleRole(ByVal role As String) As Boolean
+    If mRuleRoles Is Nothing Then Exit Function
+    IsRuleRole = mRuleRoles.Exists(UCase$(role))
+End Function
+
+Public Function RulesText() As String
+    Dim x As Variant, k As Variant, s As String, one As String
+    If mRules Is Nothing Then Exit Function
+    For Each x In mRules
+        one = CStr(x(0))
+        For Each k In x(1).Keys
+            one = one & " & not " & CStr(x(1)(k))
+        Next k
+        If s <> "" Then s = s & "; "
+        s = s & one
+    Next x
+    RulesText = s
+End Function
+
+
+'==============================================================================
+' FIELD ACCESSORS
+'==============================================================================
+
+' A bucket row: IsRole filled in. Unstaffed demand, not a person.
+Public Function IsBucket(r As Resource) As Boolean
+    If r Is Nothing Then Exit Function
+    IsBucket = (Trim$(r.Text2) <> "")
+End Function
+
+Public Function BucketRole(r As Resource) As String
+    If r Is Nothing Then Exit Function
+    BucketRole = NormalizeRole(Trim$(r.Text2))
+End Function
+
+Public Function BucketFor(p As Project, ByVal role As String) As Resource
+    Dim r As Resource
+    For Each r In p.Resources
+        If Not r Is Nothing Then
+            If StrComp(Trim$(r.Text2), role, vbTextCompare) = 0 Then
+                Set BucketFor = r
+                Exit Function
+            End If
+        End If
+    Next r
+End Function
+
+' A task whose work is deliberately spread thin rather than done at full tilt:
+' a summary carrying level-of-effort, or a hammock borrowing another task's
+' dates. Their assignment units are the whole point, so nothing may overwrite
+' them - which is what "is it a summary" alone kept missing once hammocks
+' existed to replace summary level-of-effort.
+Public Function IsStretched(t As Task) As Boolean
+    On Error Resume Next
+    If CBool(t.Summary) Then
+        IsStretched = True
+    ElseIf TaskText(t, mF_Spans) <> "" Then
+        IsStretched = True
+    End If
+End Function
+
+Public Function IsWorkPerson(r As Resource) As Boolean
+    If r Is Nothing Then Exit Function
+    If IsBucket(r) Then Exit Function
+    IsWorkPerson = (r.Type = pjResourceTypeWork)
+End Function
+
+' Task row: what kind of work this task is.
+Public Function GetTaskRole(t As Task) As String
+    GetTaskRole = NormalizeRole(Trim$(TaskText(t, mF_Role)))
+End Function
+
+Public Function GetTaskRoleRaw(t As Task) As String
+    GetTaskRoleRaw = Trim$(TaskText(t, mF_Role))
+End Function
+
+' Assignment row: the role that person fills. Same column, different row.
+Public Function GetAsgRole(a As Assignment) As String
+    GetAsgRole = Trim$(AsgText(a, mF_Role))
+End Function
+
+Public Sub SetAsgRole(a As Assignment, ByVal role As String)
+    SetAsgText a, mF_Role, role
+End Sub
+
+Public Function GetSameWorkAs(t As Task) As String
+    GetSameWorkAs = Trim$(TaskText(t, mF_SameWork))
+End Function
+
+Public Function GetSuggested(a As Assignment) As String
+    GetSuggested = Trim$(AsgText(a, mF_Suggested))
+End Function
+
+Public Sub SetSuggestion(a As Assignment, ByVal person As String, ByVal notes As String)
+    SetAsgText a, mF_Suggested, person
+    On Error Resume Next
+    a.Notes = notes
+End Sub
+
+' Role a person fills on an assignment:
+'   1) Role on the assignment row  2) Role on the task  3) their only role
+Public Function InferRole(a As Assignment, r As Resource, Optional t As Task = Nothing) As String
+    Dim s As String
+    s = GetAsgRole(a)
+    If s <> "" Then
+        If NormalizeRole(s) <> "" Then InferRole = NormalizeRole(s) Else InferRole = s
+        Exit Function
+    End If
+    If t Is Nothing Then Set t = TaskByUid(ActiveProject, a.TaskUniqueID)
+    If Not t Is Nothing Then s = GetTaskRole(t)
+    If s <> "" Then InferRole = s: Exit Function
+    InferRole = OnlyRole(r)
+End Function
+
+
+'==============================================================================
+' CUSTOM FIELD ACCESS
+'
+' Everything goes through these so the field NUMBERS live in one place - see the
+' resolved field numbers. A Select Case rather than anything clever: Project's dynamic
+' field lookup varies between versions, and this cannot fail to compile.
+'==============================================================================
+
+' Finds which TextN carries each label, so a column renamed in Project is found
+' wherever it sits. A label nothing carries resolves to 0, and the feature that
+' needs it stays off rather than guessing at a field.
+'
+' Both calls go through PA: CustomFieldGetName and FieldNameToFieldConstant vary
+' between versions, and an early-bound miss would stop the module compiling.
+Public Sub ResolveFields()
+    Dim n As Long, fid As Variant, nm As String
+
+    mF_Role = 0: mF_SameWork = 0: mF_Suggested = 0
+    mF_Spans = 0: mF_Calc = 0
+    mF_UnitStash = 0: mF_SwStash = 0: mF_SpanStash = 0
+    mF_Found = ""
+
+    On Error Resume Next
+    For n = 1 To 30
+        fid = PA.FieldNameToFieldConstant("Text" & n)
+        If Err.Number <> 0 Then
+            Err.Clear
+        Else
+            nm = ""
+            nm = PA.CustomFieldGetName(fid)
+            Err.Clear
+            Select Case True
+                Case StrComp(nm, RS_L_ROLE, vbTextCompare) = 0:      mF_Role = n
+                Case StrComp(nm, RS_L_SAMEWORK, vbTextCompare) = 0:  mF_SameWork = n
+                Case StrComp(nm, RS_L_SUGGESTED, vbTextCompare) = 0: mF_Suggested = n
+                Case StrComp(nm, RS_L_SPANS, vbTextCompare) = 0:     mF_Spans = n
+                Case StrComp(nm, RS_L_CALC, vbTextCompare) = 0:      mF_Calc = n
+                Case StrComp(nm, RS_L_UNITSTASH, vbTextCompare) = 0: mF_UnitStash = n
+                Case StrComp(nm, RS_L_SWSTASH, vbTextCompare) = 0:   mF_SwStash = n
+                Case StrComp(nm, RS_L_SPANSTASH, vbTextCompare) = 0: mF_SpanStash = n
+                Case Else: nm = ""
+            End Select
+            If nm <> "" Then mF_Found = mF_Found & nm & "=Text" & n & "   "
+        End If
+    Next n
+    On Error GoTo 0
+End Sub
+
+' The first Text field with no name of its own, or 0 if all thirty are taken.
+Public Function FirstFreeTextField() As Long
+    Dim n As Long, fid As Variant, nm As String
+    On Error Resume Next
+    For n = 1 To 30
+        fid = PA.FieldNameToFieldConstant("Text" & n)
+        If Err.Number = 0 Then
+            nm = ""
+            nm = PA.CustomFieldGetName(fid)
+            Err.Clear
+            If nm = "" Or StrComp(nm, "Text" & n, vbTextCompare) = 0 Then
+                FirstFreeTextField = n
+                Exit Function
+            End If
+        End If
+        Err.Clear
+    Next n
+End Function
+
+' Labels no column carries. The feature behind each one is off until it's named.
+Public Function MissingLabels() As Collection
+    Dim c As New Collection
+    Set MissingLabels = c
+    If mF_Role = 0 Then c.Add RS_L_ROLE
+    If mF_SameWork = 0 Then c.Add RS_L_SAMEWORK
+    If mF_Suggested = 0 Then c.Add RS_L_SUGGESTED
+    If mF_Spans = 0 Then c.Add RS_L_SPANS
+    If mF_Calc = 0 Then c.Add RS_L_CALC
+    If mF_UnitStash = 0 Then c.Add RS_L_UNITSTASH
+    If mF_SwStash = 0 Then c.Add RS_L_SWSTASH
+    If mF_SpanStash = 0 Then c.Add RS_L_SPANSTASH
+End Function
+
+' Names a FREE Text field after each missing label - whichever is free, the
+' number doesn't matter. Never renames a field that already has a name.
+Public Function NameMissingColumns(ByRef ranOut As Boolean) As Long
+    Dim x As Variant, fid As Variant, n As Long, free As Long
+
+    On Error Resume Next
+    For Each x In MissingLabels()
+        free = FirstFreeTextField()
+        If free = 0 Then
+            ranOut = True
+            Exit For
+        End If
+        fid = PA.FieldNameToFieldConstant("Text" & free)
+        If Err.Number = 0 Then
+            PA.CustomFieldRename FieldID:=fid, NewName:=CStr(x)
+            If Err.Number = 0 Then n = n + 1
+        End If
+        Err.Clear
+        ResolveFields
+    Next x
+    On Error GoTo 0
+    NameMissingColumns = n
+End Function
+
+Public Function FieldsFound() As String
+    FieldsFound = mF_Found
+End Function
+
+Public Function TaskText(t As Task, ByVal n As Long) As String
+    On Error Resume Next
+    If n < 1 Then Exit Function
+    Select Case n
+        Case 1: TaskText = t.Text1
+        Case 2: TaskText = t.Text2
+        Case 3: TaskText = t.Text3
+        Case 4: TaskText = t.Text4
+        Case 5: TaskText = t.Text5
+        Case 6: TaskText = t.Text6
+        Case 7: TaskText = t.Text7
+        Case 8: TaskText = t.Text8
+        Case 9: TaskText = t.Text9
+        Case 10: TaskText = t.Text10
+        Case 11: TaskText = t.Text11
+        Case 12: TaskText = t.Text12
+        Case 13: TaskText = t.Text13
+        Case 14: TaskText = t.Text14
+        Case 15: TaskText = t.Text15
+        Case 16: TaskText = t.Text16
+        Case 17: TaskText = t.Text17
+        Case 18: TaskText = t.Text18
+        Case 19: TaskText = t.Text19
+        Case 20: TaskText = t.Text20
+        Case 21: TaskText = t.Text21
+        Case 22: TaskText = t.Text22
+        Case 23: TaskText = t.Text23
+        Case 24: TaskText = t.Text24
+        Case 25: TaskText = t.Text25
+        Case 26: TaskText = t.Text26
+        Case 27: TaskText = t.Text27
+        Case 28: TaskText = t.Text28
+        Case 29: TaskText = t.Text29
+        Case 30: TaskText = t.Text30
+    End Select
+    TaskText = Trim$(TaskText)
+End Function
+
+Public Sub SetTaskText(t As Task, ByVal n As Long, ByVal v As String)
+    On Error Resume Next
+    If n < 1 Then Exit Sub
+    Select Case n
+        Case 1: t.Text1 = v
+        Case 2: t.Text2 = v
+        Case 3: t.Text3 = v
+        Case 4: t.Text4 = v
+        Case 5: t.Text5 = v
+        Case 6: t.Text6 = v
+        Case 7: t.Text7 = v
+        Case 8: t.Text8 = v
+        Case 9: t.Text9 = v
+        Case 10: t.Text10 = v
+        Case 11: t.Text11 = v
+        Case 12: t.Text12 = v
+        Case 13: t.Text13 = v
+        Case 14: t.Text14 = v
+        Case 15: t.Text15 = v
+        Case 16: t.Text16 = v
+        Case 17: t.Text17 = v
+        Case 18: t.Text18 = v
+        Case 19: t.Text19 = v
+        Case 20: t.Text20 = v
+        Case 21: t.Text21 = v
+        Case 22: t.Text22 = v
+        Case 23: t.Text23 = v
+        Case 24: t.Text24 = v
+        Case 25: t.Text25 = v
+        Case 26: t.Text26 = v
+        Case 27: t.Text27 = v
+        Case 28: t.Text28 = v
+        Case 29: t.Text29 = v
+        Case 30: t.Text30 = v
+    End Select
+End Sub
+
+Public Function AsgText(a As Assignment, ByVal n As Long) As String
+    On Error Resume Next
+    If n < 1 Then Exit Function
+    Select Case n
+        Case 1: AsgText = a.Text1
+        Case 2: AsgText = a.Text2
+        Case 3: AsgText = a.Text3
+        Case 4: AsgText = a.Text4
+        Case 5: AsgText = a.Text5
+        Case 6: AsgText = a.Text6
+        Case 7: AsgText = a.Text7
+        Case 8: AsgText = a.Text8
+        Case 9: AsgText = a.Text9
+        Case 10: AsgText = a.Text10
+        Case 11: AsgText = a.Text11
+        Case 12: AsgText = a.Text12
+        Case 13: AsgText = a.Text13
+        Case 14: AsgText = a.Text14
+        Case 15: AsgText = a.Text15
+        Case 16: AsgText = a.Text16
+        Case 17: AsgText = a.Text17
+        Case 18: AsgText = a.Text18
+        Case 19: AsgText = a.Text19
+        Case 20: AsgText = a.Text20
+        Case 21: AsgText = a.Text21
+        Case 22: AsgText = a.Text22
+        Case 23: AsgText = a.Text23
+        Case 24: AsgText = a.Text24
+        Case 25: AsgText = a.Text25
+        Case 26: AsgText = a.Text26
+        Case 27: AsgText = a.Text27
+        Case 28: AsgText = a.Text28
+        Case 29: AsgText = a.Text29
+        Case 30: AsgText = a.Text30
+    End Select
+    AsgText = Trim$(AsgText)
+End Function
+
+Public Sub SetAsgText(a As Assignment, ByVal n As Long, ByVal v As String)
+    On Error Resume Next
+    If n < 1 Then Exit Sub
+    Select Case n
+        Case 1: a.Text1 = v
+        Case 2: a.Text2 = v
+        Case 3: a.Text3 = v
+        Case 4: a.Text4 = v
+        Case 5: a.Text5 = v
+        Case 6: a.Text6 = v
+        Case 7: a.Text7 = v
+        Case 8: a.Text8 = v
+        Case 9: a.Text9 = v
+        Case 10: a.Text10 = v
+        Case 11: a.Text11 = v
+        Case 12: a.Text12 = v
+        Case 13: a.Text13 = v
+        Case 14: a.Text14 = v
+        Case 15: a.Text15 = v
+        Case 16: a.Text16 = v
+        Case 17: a.Text17 = v
+        Case 18: a.Text18 = v
+        Case 19: a.Text19 = v
+        Case 20: a.Text20 = v
+        Case 21: a.Text21 = v
+        Case 22: a.Text22 = v
+        Case 23: a.Text23 = v
+        Case 24: a.Text24 = v
+        Case 25: a.Text25 = v
+        Case 26: a.Text26 = v
+        Case 27: a.Text27 = v
+        Case 28: a.Text28 = v
+        Case 29: a.Text29 = v
+        Case 30: a.Text30 = v
+    End Select
+End Sub
+
+
+'==============================================================================
+' RELATIONS
+' What upstream work does each task's rules reach back to?
+'==============================================================================
+
+' The self-maintaining columns bring themselves up to date here: SpanCalc
+' recalculates Work, hammocks re-borrow their dates, SameWorkAs re-renders its
+' row IDs. That's wanted - those columns exist to look after themselves - but it
+' means every report writes something.
+'
+' So it goes in an undo transaction, unless a caller already opened one (our own
+' macros set gRS_Suppress while they work). Without this the maintenance writes
+' happen loose, and a report you ran to LOOK at something leaves changes you
+' can't take back.
+Public Sub BuildRelations(p As Project)
+    Dim ownTx As Boolean
+
+    BuildRelationsRaw p
+
+    If gRS_Suppress = 0 Then
+        On Error Resume Next
+        Application.OpenUndoTransaction "Role Staffing: refresh maintained columns"
+        ownTx = (Err.Number = 0)
+        Err.Clear
+        On Error GoTo 0
+    End If
+
+    RefitCalcs p
+    RefitSpans p
+    SyncCovers p
+
+    If ownTx Then
+        On Error Resume Next
+        Application.CloseUndoTransaction
+        On Error GoTo 0
+    End If
+
+    ResolveAllUpstream p
+End Sub
+
+' The task/role/people index, without resolving what covers what.
+Public Sub BuildRelationsRaw(p As Project)
+    Dim t As Task, a As Assignment, r As Resource
+    Dim info As Object, roles As Object, people As Collection
+    Dim role As String, k As Variant, u As Variant
+
+    Set mProject = p
+    Set mTasks = NewDict()
+    Set mTaskUid = NewDict()
+    Set mPreds = NewDict()
+    Set mPplMemo = NewDict()
+    Set mUp = NewDict()
+    Set mDown = NewDict()
+    Set mCoverKind = NewDict()
+    Set mProblems = NewDict()
+
+    For Each t In p.Tasks
+        If Not t Is Nothing Then
+            Set info = NewDict()
+            Set roles = NewDict()
+            Set people = New Collection
+            info("id") = t.ID
+            info("name") = t.Name
+            info("summary") = CBool(t.Summary)
+
+            role = GetTaskRole(t)
+            If role <> "" Then roles(UCase$(role)) = role
+
+            For Each a In t.Assignments
+                Set r = ResourceOf(p, a)
+                If Not r Is Nothing Then
+                    If IsBucket(r) Then
+                        role = BucketRole(r)
+                        If role <> "" Then roles(UCase$(role)) = role
+                    ElseIf r.Type = pjResourceTypeWork Then
+                        role = InferRole(a, r, t)
+                        If role <> "" Then
+                            roles(UCase$(role)) = role
+                            people.Add Array(r.ID, role, a.UniqueID)
+                        End If
+                    End If
+                End If
+            Next a
+
+            Set info("roles") = roles
+            Set info("people") = people
+            Set mTasks(CStr(t.UniqueID)) = info
+            Set mTaskUid(CStr(t.UniqueID)) = t
+            Set mPreds(CStr(t.UniqueID)) = PredUids(t)
+            Set mProblems(CStr(t.UniqueID)) = New Collection
+        End If
+    Next t
+
+End Sub
+
+Public Sub ResolveAllUpstream(p As Project)
+    Dim k As Variant, u As Variant
+
+    ' Upstream, only for tasks that carry a role some rule cares about
+    For Each k In mTasks.Keys
+        If TouchesRules(CStr(k)) Then ResolveUpstream TaskByUid(p, CLng(k)), CStr(k)
+    Next k
+
+    CloseUpstream
+
+    ' Reverse map
+    For Each k In mUp.Keys
+        For Each u In mUp(k).Keys
+            If Not mDown.Exists(CStr(u)) Then Set mDown(CStr(u)) = NewDict()
+            mDown(CStr(u))(CStr(k)) = True
+        Next u
+    Next k
+End Sub
+
+' "Same work as" carries. Draft > Check > Approve is one piece of work, so if
+' the Approve task names the Check task and the Check task names the Draft task,
+' the drafting is the Approve task's upstream work too - otherwise a
+' Draft&!Approve rule looks straight past it, and you'd have to list every
+' earlier task on every later one by hand.
+Private Sub CloseUpstream()
+    Dim k As Variant, u As Variant, v As Variant
+    Dim added As Boolean, rounds As Long, extra As Object
+
+    Do
+        added = False
+        rounds = rounds + 1
+        For Each k In mUp.Keys
+            Set extra = NewDict()
+            For Each u In mUp(k).Keys
+                If mUp.Exists(CStr(u)) Then
+                    For Each v In mUp(CStr(u)).Keys
+                        ' not itself, and not something we already have
+                        If CStr(v) <> CStr(k) Then
+                            If Not mUp(k).Exists(CStr(v)) Then extra(CStr(v)) = True
+                        End If
+                    Next v
+                End If
+            Next u
+            For Each v In extra.Keys
+                mUp(k)(CStr(v)) = True
+                added = True
+            Next v
+        Next k
+    Loop While added And rounds < RS_MAX_LINK_DEPTH
+End Sub
+
+Public Function TouchesRules(ByVal key As String) As Boolean
+    Dim k As Variant
+    If mTasks Is Nothing Then Exit Function
+    If Not mTasks.Exists(key) Then Exit Function
+    For Each k In mTasks(key)("roles").Keys
+        If IsRuleRole(CStr(k)) Then
+            TouchesRules = True
+            Exit Function
+        End If
+    Next k
+End Function
+
+Private Sub ResolveUpstream(t As Task, ByVal key As String)
+    Dim up As Object, probs As Collection
+    Dim ov As String, parts As Variant, part As Variant, sPart As String, k2 As String
+    Dim visited As Object, queue As Collection, item As Variant
+    Dim cur As Task, pred As Task, depth As Long, ck As String, found As Boolean
+
+    Set up = NewDict()
+    Set mUp(key) = up
+    Set probs = mProblems(key)
+
+    ov = GetSameWorkAs(t)
+    If ov <> "" Then
+        mCoverKind(key) = "SameWorkAs"
+        If StrComp(ov, "none", vbTextCompare) = 0 Then Exit Sub
+        parts = Split(Replace(Replace(ov, ";", ","), " ", ","), ",")
+        For Each part In parts
+            sPart = Trim$(CStr(part))
+            If sPart <> "" Then
+                k2 = ResolveCoverRef(sPart, probs)
+                If k2 = key Then
+                    ' Same trap Predecessors has: a task can't be its own
+                    ' upstream work, and letting it through makes every rule
+                    ' fire against the person doing this very task.
+                    probs.Add RS_COVERS_LABEL & " points at this task itself (" & _
+                              TaskIdOf(key) & "). Ignored - it has to name the OTHER task."
+                ElseIf k2 <> "" Then
+                    up(k2) = True
+                End If
+            End If
+        Next part
+        Exit Sub
+    End If
+
+    mCoverKind(key) = "Links"
+    Set visited = NewDict()
+    visited(key) = True
+    Set queue = New Collection
+    For Each pred In PredecessorsOf(t)
+        queue.Add Array(pred, 1)
+    Next pred
+
+    Do While queue.Count > 0
+        item = queue(1)
+        queue.Remove 1
+        Set cur = item(0)
+        depth = item(1)
+        ck = CStr(cur.UniqueID)
+
+        If Not visited.Exists(ck) And mTasks.Exists(ck) Then
+            visited(ck) = True
+            If TouchesRules(ck) Then
+                up(ck) = True
+            Else
+                found = False
+                If CBool(cur.Summary) Then found = AddRuleDescendants(cur, up)
+                If Not found And depth < RS_MAX_LINK_DEPTH Then
+                    For Each pred In PredecessorsOf(cur)
+                        queue.Add Array(pred, depth + 1)
+                    Next pred
+                End If
+            End If
+        End If
+    Loop
+
+    If up.Count = 0 Then
+        probs.Add "No related upstream work found through predecessor links. " & _
+                  "Link it, or put the task ID in " & RS_COVERS_LABEL & " (""none"" if it genuinely covers nothing)."
+    End If
+End Sub
+
+' What one SameWorkAs entry points at, as a task Unique ID key.
+'
+' A bare number means whichever RS_COVERS_BY_ROW_ID says. "#33" always means the
+' row ID, "u47" always means the Unique ID. If the preferred reading finds
+' nothing but the other one does, it uses that and says so, rather than
+' reporting "not found" about a task that is plainly sitting there.
+Public Function ResolveCoverRef(ByVal ref As String, probs As Collection) As String
+    Dim n As Long, byRow As Boolean, forced As Boolean, k As String
+
+    ref = Trim$(ref)
+    byRow = RS_COVERS_BY_ROW_ID
+
+    If Left$(ref, 1) = "#" Then
+        ref = Trim$(Mid$(ref, 2)): byRow = True: forced = True
+    ElseIf LCase$(Left$(ref, 1)) = "u" Then
+        ref = Trim$(Mid$(ref, 2)): byRow = False: forced = True
+    End If
+
+    If Not IsNumeric(ref) Then
+        probs.Add """" & ref & """ in " & RS_COVERS_LABEL & " isn't a number. Use the task's ID, " & _
+                  "or u<number> for a Unique ID."
+        Exit Function
+    End If
+    n = CLng(ref)
+
+    ' preferred reading
+    If byRow Then
+        k = UidForRowId(n)
+    ElseIf mTasks.Exists(CStr(n)) Then
+        k = CStr(n)
+    End If
+    If k <> "" Then
+        ResolveCoverRef = k
+        Exit Function
+    End If
+    If forced Then
+        probs.Add RS_COVERS_LABEL & ": no task with " & IIf(byRow, "ID ", "Unique ID ") & n & "."
+        Exit Function
+    End If
+
+    ' the other one, if that's clearly what was meant
+    If byRow Then
+        If mTasks.Exists(CStr(n)) Then
+            probs.Add RS_COVERS_LABEL & " " & n & ": no task has that ID, but one has that UNIQUE ID (" & _
+                      TaskNameOf(CStr(n)) & ") - used it. Write u" & n & " to mean that on purpose."
+            ResolveCoverRef = CStr(n)
+            Exit Function
+        End If
+    Else
+        k = UidForRowId(n)
+        If k <> "" Then
+            probs.Add RS_COVERS_LABEL & " " & n & ": no task has that Unique ID, but task ID " & n & " (" & _
+                      TaskNameOf(k) & ") does - used it. Write #" & n & " to mean that on purpose."
+            ResolveCoverRef = k
+            Exit Function
+        End If
+    End If
+
+    probs.Add RS_COVERS_LABEL & ": nothing matches " & n & ", as either an ID or a Unique ID."
+End Function
+
+' The Unique ID of the task whose row ID is this, or "" - so we can tell someone
+' they typed the wrong one of the two rather than just "not found".
+Private Function UidForRowId(ByVal rowId As Long) As String
+    Dim k As Variant
+    If mTasks Is Nothing Then Exit Function
+    For Each k In mTasks.Keys
+        If ToDbl(mTasks(k)("id")) = rowId Then
+            UidForRowId = CStr(k)
+            Exit Function
+        End If
+    Next k
+End Function
+
+Private Function AddRuleDescendants(summary As Task, up As Object) As Boolean
+    Dim child As Task, ck As String
+    On Error Resume Next
+    For Each child In summary.OutlineChildren
+        If Not child Is Nothing Then
+            ck = CStr(child.UniqueID)
+            If CBool(child.Summary) Then
+                If AddRuleDescendants(child, up) Then AddRuleDescendants = True
+            ElseIf mTasks.Exists(ck) Then
+                If TouchesRules(ck) Then
+                    up(ck) = True
+                    AddRuleDescendants = True
+                End If
+            End If
+        End If
+    Next child
+End Function
+
+' Predecessor UIDs, collected once. PredecessorTasks is a COM enumeration and
+' PredFinish recurses through it.
+Private Function PredUids(t As Task) As Collection
+    Dim c As New Collection, x As Task
+    On Error Resume Next
+    For Each x In t.PredecessorTasks
+        If Not x Is Nothing Then
+            If Not x.ExternalTask Then c.Add CStr(x.UniqueID)
+        End If
+    Next x
+    Set PredUids = c
+End Function
+
+Public Function PredsOf(ByVal key As String) As Collection
+    If Not mPreds Is Nothing Then
+        If mPreds.Exists(key) Then
+            Set PredsOf = mPreds(key)
+            Exit Function
+        End If
+    End If
+    Set PredsOf = New Collection
+End Function
+
+Private Function PredecessorsOf(t As Task) As Collection
+    Dim c As New Collection, x As Task
+    On Error Resume Next
+    For Each x In t.PredecessorTasks
+        If Not x Is Nothing Then
+            If Not x.ExternalTask Then c.Add x
+        End If
+    Next x
+    Set PredecessorsOf = c
+End Function
+
+' ---- queries ----------------------------------------------------------------
+
+Public Function TaskHasRole(ByVal key As String, ByVal role As String) As Boolean
+    If mTasks Is Nothing Then Exit Function
+    If mTasks.Exists(key) Then TaskHasRole = mTasks(key)("roles").Exists(UCase$(role))
+End Function
+
+Public Function TaskIdOf(ByVal key As String) As Long
+    If mTasks Is Nothing Then Exit Function
+    If mTasks.Exists(key) Then TaskIdOf = mTasks(key)("id")
+End Function
+
+Public Function TaskNameOf(ByVal key As String) As String
+    If mTasks Is Nothing Then Exit Function
+    If mTasks.Exists(key) Then TaskNameOf = mTasks(key)("name")
+End Function
+
+Public Function TaskKeys() As Variant
+    If mTasks Is Nothing Then Exit Function
+    TaskKeys = mTasks.Keys
+End Function
+
+Public Function UpstreamOf(ByVal key As String) As Object
+    If mUp Is Nothing Then
+        Set UpstreamOf = NewDict()
+        Exit Function
+    End If
+    If mUp.Exists(key) Then Set UpstreamOf = mUp(key) Else Set UpstreamOf = NewDict()
+End Function
+
+Public Function DownstreamOf(ByVal key As String) As Object
+    If mDown Is Nothing Then
+        Set DownstreamOf = NewDict()
+        Exit Function
+    End If
+    If mDown.Exists(key) Then Set DownstreamOf = mDown(key) Else Set DownstreamOf = NewDict()
+End Function
+
+Public Function CoverKind(ByVal key As String) As String
+    If mCoverKind Is Nothing Then Exit Function
+    If mCoverKind.Exists(key) Then CoverKind = mCoverKind(key)
+End Function
+
+Public Function TaskProblems(ByVal key As String) As Collection
+    If mProblems Is Nothing Then
+        Set TaskProblems = New Collection
+        Exit Function
+    End If
+    If mProblems.Exists(key) Then Set TaskProblems = mProblems(key) Else Set TaskProblems = New Collection
+End Function
+
+' resId (as string) -> True, for people filling a role on a task
+' Called for every candidate of every task, once per rule, once per related
+' task - so it memoises. Only the plain case is cached; a call that ignores one
+' assignment is rare and computed fresh.
+Public Function PeopleIn(ByVal key As String, ByVal role As String, _
+                         Optional ByVal ignoreAsgUid As Long = -999999) As Object
+    Dim d As Object, e As Variant, ck As String, plain As Boolean
+    Set d = NewDict()
+    Set PeopleIn = d
+    If mTasks Is Nothing Then Exit Function
+
+    plain = (ignoreAsgUid = -999999)
+    If plain And Not mPplMemo Is Nothing Then
+        ck = key & "|" & UCase$(role)
+        If mPplMemo.Exists(ck) Then
+            Set PeopleIn = mPplMemo(ck)
+            Exit Function
+        End If
+    End If
+
+    If mTasks.Exists(key) Then
+        For Each e In mTasks(key)("people")
+            If StrComp(CStr(e(1)), role, vbTextCompare) = 0 And CLng(e(2)) <> ignoreAsgUid Then
+                d(CStr(e(0))) = True
+            End If
+        Next e
+    End If
+
+    If plain And Not mPplMemo Is Nothing Then Set mPplMemo(ck) = d
+    Set PeopleIn = d
+End Function
+
+Public Function PeopleNames(ByVal key As String, ByVal role As String) As String
+    Dim k As Variant, s As String, r As Resource
+    For Each k In PeopleIn(key, role).Keys
+        Set r = Nothing
+        On Error Resume Next
+        Set r = mProject.Resources(CLng(k))
+        On Error GoTo 0
+        If Not r Is Nothing Then
+            If s <> "" Then s = s & ", "
+            s = s & r.Name
+        End If
+    Next k
+    PeopleNames = s
+End Function
+
+' Why this person can't take this role on this task, or "" if they can.
+' Rules are symmetric - it doesn't matter which end you assign first.
+Public Function FindConflict(ByVal taskUid As Long, ByVal resId As Long, ByVal role As String, _
+                             Optional ByVal ignoreAsgUid As Long = -999999) As String
+    Dim key As String, rid As String, x As Variant, k As Variant, u As Variant
+    Dim trig As String, forb As Object, other As String
+
+    key = CStr(taskUid)
+    rid = CStr(resId)
+    If mRules Is Nothing Then Exit Function
+    If Not mTasks.Exists(key) Then Exit Function
+    If role = "" Then Exit Function
+
+    For Each x In mRules
+        trig = CStr(x(0))
+        Set forb = x(1)
+
+        ' assigning a forbidden role: did they do the trigger role on related work?
+        If forb.Exists(UCase$(role)) Then
+            If PeopleIn(key, trig, ignoreAsgUid).Exists(rid) Then
+                FindConflict = "is " & trig & " on this same task"
+                Exit Function
+            End If
+            For Each u In UpstreamOf(key).Keys
+                If PeopleIn(CStr(u), trig, ignoreAsgUid).Exists(rid) Then
+                    FindConflict = "was " & trig & " on task " & TaskIdOf(CStr(u)) & _
+                                   " (" & TaskNameOf(CStr(u)) & "), which this task covers"
+                    Exit Function
+                End If
+            Next u
+        End If
+
+        ' assigning the trigger role: are they already doing a forbidden role downstream?
+        If StrComp(trig, role, vbTextCompare) = 0 Then
+            For Each k In forb.Keys
+                other = CStr(forb(k))
+                If PeopleIn(key, other, ignoreAsgUid).Exists(rid) Then
+                    FindConflict = "is " & other & " on this same task"
+                    Exit Function
+                End If
+                For Each u In DownstreamOf(key).Keys
+                    If PeopleIn(CStr(u), other, ignoreAsgUid).Exists(rid) Then
+                        FindConflict = "is " & other & " on task " & TaskIdOf(CStr(u)) & _
+                                       " (" & TaskNameOf(CStr(u)) & "), which covers this task"
+                        Exit Function
+                    End If
+                Next u
+            Next k
+        End If
+    Next x
+End Function
+
+Public Sub AddTentative(ByVal taskUid As Long, ByVal resId As Long, ByVal role As String)
+    Dim key As String
+    key = CStr(taskUid)
+    If mTasks Is Nothing Then Exit Sub
+    If mTasks.Exists(key) Then
+        mTasks(key)("roles")(UCase$(role)) = role
+        mTasks(key)("people").Add Array(resId, role, -1)
+        ' only this task's people in this role changed
+        If Not mPplMemo Is Nothing Then
+            If mPplMemo.Exists(key & "|" & UCase$(role)) Then
+                mPplMemo.Remove key & "|" & UCase$(role)
+            End If
+        End If
+    End If
+End Sub
+
+' Every rule breach currently in the file: Array(taskKey, relatedKey, resId, trigger, forbidden)
+Public Function Violations() As Collection
+    Dim out As New Collection, k As Variant, u As Variant, pid As Variant
+    Dim x As Variant, trig As String, fk As Variant, other As String
+    Dim doers As Object, scope As Object
+
+    Set Violations = out
+    If mRules Is Nothing Or mTasks Is Nothing Then Exit Function
+
+    For Each k In mTasks.Keys
+        For Each x In mRules
+            trig = CStr(x(0))
+            For Each fk In x(1).Keys
+                other = CStr(x(1)(fk))
+                Set doers = PeopleIn(CStr(k), other)
+                If doers.Count > 0 Then
+                    Set scope = NewDict()
+                    For Each u In UpstreamOf(CStr(k)).Keys
+                        scope(CStr(u)) = True
+                    Next u
+                    scope(CStr(k)) = True
+                    For Each u In scope.Keys
+                        For Each pid In PeopleIn(CStr(u), trig).Keys
+                            If doers.Exists(CStr(pid)) Then
+                                out.Add Array(CStr(k), CStr(u), CLng(pid), trig, other)
+                            End If
+                        Next pid
+                    Next u
+                End If
+            Next fk
+        Next x
+    Next k
+    Set Violations = out
+End Function
+
+Public Function DescribeRelated(ByVal taskUid As Long) As String
+    Dim key As String, u As Variant, s As String
+    key = CStr(taskUid)
+    For Each u In UpstreamOf(key).Keys
+        If s <> "" Then s = s & ", "
+        s = s & TaskIdOf(CStr(u))
+    Next u
+    If s <> "" Then
+        DescribeRelated = "covers task " & s
+    ElseIf CoverKind(key) = "SameWorkAs" Then
+        DescribeRelated = "covers nothing (" & RS_COVERS_LABEL & " = none)"
+    End If
+End Function
+
+
+'==============================================================================
+' LOAD
+' Weekly minutes per person, per role. Level-of-effort included.
+'==============================================================================
+
+Public Sub BuildLoad(p As Project)
+    Dim r As Resource, a As Assignment, ww As Object, k As Variant, role As String
+
+    Set mRoleLoad = NewDict()
+    Set mTotalLoad = NewDict()
+    Set mOpenLoad = NewDict()
+    Set mWeeks = NewDict()
+    mMinPerWeek = MinutesPerWeek(p)
+
+    For Each r In p.Resources
+        If Not r Is Nothing Then
+            If IsBucket(r) Then
+                role = BucketRole(r)
+                For Each a In r.Assignments
+                    Set ww = WeeklyWork(a)
+                    For Each k In ww.Keys
+                        AddOpen role, CStr(k), ToDbl(ww(k))
+                    Next k
+                Next a
+            ElseIf r.Type = pjResourceTypeWork Then
+                For Each a In r.Assignments
+                    role = InferRole(a, r)
+                    Set ww = WeeklyWork(a)
+                    For Each k In ww.Keys
+                        AddLoad r.ID, role, CStr(k), ToDbl(ww(k))
+                    Next k
+                Next a
+            End If
+        End If
+    Next r
+End Sub
+
+Public Sub AddLoad(ByVal resId As Long, ByVal role As String, ByVal wk As String, ByVal minutes As Double)
+    Dim k As String
+    If mRoleLoad Is Nothing Then Exit Sub
+    If role <> "" Then
+        k = resId & "|" & UCase$(role) & "|" & wk
+        mRoleLoad(k) = ToDbl(mRoleLoad(k)) + minutes
+    End If
+    k = resId & "|" & wk
+    mTotalLoad(k) = ToDbl(mTotalLoad(k)) + minutes
+    mWeeks(wk) = True
+End Sub
+
+Public Sub AddOpen(ByVal role As String, ByVal wk As String, ByVal minutes As Double)
+    Dim k As String
+    If mOpenLoad Is Nothing Then Exit Sub
+    k = UCase$(role) & "|" & wk
+    mOpenLoad(k) = ToDbl(mOpenLoad(k)) + minutes
+    mWeeks(wk) = True
+End Sub
+
+Public Function RoleLoad(ByVal resId As Long, ByVal role As String, ByVal wk As String) As Double
+    If mRoleLoad Is Nothing Then Exit Function
+    RoleLoad = ToDbl(mRoleLoad(resId & "|" & UCase$(role) & "|" & wk))
+End Function
+
+Public Function TotalLoad(ByVal resId As Long, ByVal wk As String) As Double
+    If mTotalLoad Is Nothing Then Exit Function
+    TotalLoad = ToDbl(mTotalLoad(resId & "|" & wk))
+End Function
+
+Public Function OpenLoad(ByVal role As String, ByVal wk As String) As Double
+    If mOpenLoad Is Nothing Then Exit Function
+    OpenLoad = ToDbl(mOpenLoad(UCase$(role) & "|" & wk))
+End Function
+
+Public Function LoadWeeks() As Variant
+    If mWeeks Is Nothing Then Exit Function
+    LoadWeeks = mWeeks.Keys
+End Function
+
+' The hard wall: real availability to the project, in minutes per week.
+Public Function TotalCapacity(r As Resource) As Double
+    If Not mCap Is Nothing Then
+        If mCap.Exists(CStr(r.ID)) Then
+            TotalCapacity = ToDbl(mCap(CStr(r.ID)))
+            Exit Function
+        End If
+    End If
+    TotalCapacity = ToFraction(r.MaxUnits) * mMinPerWeek
+End Function
+
+' The rate somebody works at on a task: everything they have. They do one thing
+' at a time. The RoleAvail share decides which work they're given, not how fast
+' they do it - see RS_UNITS_MODE.
+Public Function RoleRate(r As Resource, ByVal role As String) As Double
+    RoleRate = TotalCapacity(r)
+End Function
+
+' Soft target: where their time goes first. Not a cap - unused share lends out.
+Public Function RoleTarget(r As Resource, ByVal role As String) As Double
+    RoleTarget = RoleShare(r, role) * TotalCapacity(r)
+End Function
+
+
+' Project's view, filter, group and levelling methods vary between versions -
+' a method that doesn't exist, or a parameter renamed, is a COMPILE error on an
+' early-bound call, which would stop the whole module compiling. Going through
+' a late-bound Object turns that into a runtime error the callers already
+' report. Don't "tidy" this away.
+'
+' Public and in the core module because every module needs it.
+Public Function PA() As Object
+    Set PA = Application
+End Function
+
+'==============================================================================
+' HELPERS
+
+Public Sub AddSection(rep As Collection, ByVal title As String, items As Collection)
+    Dim x As Variant
+    rep.Add title
+    rep.Add String$(Len(title), "-")
+    If items.Count = 0 Then
+        rep.Add "   (none)"
+    Else
+        For Each x In items
+            rep.Add "   " & CStr(x)
+        Next x
+    End If
+    rep.Add ""
+End Sub
+'==============================================================================
+
+Public Function NewDict() As Object
+    Set NewDict = CreateObject("Scripting.Dictionary")
+    NewDict.CompareMode = vbTextCompare
+End Function
+
+Public Function ToDbl(ByVal v As Variant) As Double
+    On Error GoTo Bad
+    If IsEmpty(v) Or IsNull(v) Then Exit Function
+    If VarType(v) = vbString Then
+        If Len(Trim$(v)) = 0 Or Not IsNumeric(v) Then Exit Function
+    End If
+    ToDbl = CDbl(v)
+    Exit Function
+Bad:
+    ToDbl = 0
+End Function
+
+' Units as a fraction (1 = 100%); tolerates versions that report percent.
+Public Function ToFraction(ByVal v As Variant) As Double
+    Dim d As Double
+    d = ToDbl(v)
+    If d > 20 Then d = d / 100#
+    ToFraction = d
+End Function
+
+Public Function MaxD(ByVal a As Double, ByVal b As Double) As Double
+    If a > b Then MaxD = a Else MaxD = b
+End Function
+
+Public Function MinD(ByVal a As Double, ByVal b As Double) As Double
+    If a < b Then MinD = a Else MinD = b
+End Function
+
+Public Function MinutesPerWeek(p As Project) As Double
+    Dim h As Double
+    h = ToDbl(p.HoursPerWeek)
+    If h <= 0 Then h = 40
+    MinutesPerWeek = h * 60#
+End Function
+
+Public Function HaveProject(ByRef p As Project) As Boolean
+    On Error Resume Next
+    Set p = Nothing
+    If Application.Projects.Count > 0 Then Set p = ActiveProject
+    On Error GoTo 0
+    If p Is Nothing Then
+        MsgBox "Open a project first.", vbInformation, "Role Staffing"
+    Else
+        HaveProject = True
+    End If
+End Function
+
+' Called for nearly every assignment in every pass, so it goes through an index
+' rather than a COM lookup each time.
+Public Function ResourceOf(p As Project, a As Assignment) As Resource
+    Dim k As String
+    On Error Resume Next
+    k = CStr(a.ResourceUniqueID)
+    If Not mResUid Is Nothing Then
+        If mResUid.Exists(k) Then
+            Set ResourceOf = mResUid(k)
+            Exit Function
+        End If
+    End If
+    Set ResourceOf = p.Resources.UniqueID(a.ResourceUniqueID)
+End Function
+
+Public Function ResourceByName(p As Project, ByVal nm As String) As Resource
+    Dim r As Resource
+    If Not mResName Is Nothing Then
+        If mResName.Exists(LCase$(Trim$(nm))) Then
+            Set ResourceByName = mResName(LCase$(Trim$(nm)))
+            Exit Function
+        End If
+    End If
+    For Each r In p.Resources
+        If Not r Is Nothing Then
+            If StrComp(r.Name, Trim$(nm), vbTextCompare) = 0 Then
+                Set ResourceByName = r
+                Exit Function
+            End If
+        End If
+    Next r
+End Function
+
+Public Function TaskByUid(p As Project, ByVal uid As Long) As Task
+    On Error Resume Next
+    If Not mTaskUid Is Nothing Then
+        If mTaskUid.Exists(CStr(uid)) Then
+            Set TaskByUid = mTaskUid(CStr(uid))
+            Exit Function
+        End If
+    End If
+    Set TaskByUid = p.Tasks.UniqueID(uid)
+End Function
+
+Public Function FindAssignment(t As Task, ByVal asgUid As Long) As Assignment
+    Dim a As Assignment
+    For Each a In t.Assignments
+        If a.UniqueID = asgUid Then Set FindAssignment = a: Exit Function
+    Next a
+End Function
+
+Public Function FindAssignmentByResource(t As Task, ByVal resId As Long) As Assignment
+    Dim a As Assignment
+    For Each a In t.Assignments
+        If a.ResourceID = resId Then Set FindAssignmentByResource = a: Exit Function
+    Next a
+End Function
+
+Public Function PersonOnTask(t As Task, ByVal resId As Long) As Boolean
+    PersonOnTask = Not (FindAssignmentByResource(t, resId) Is Nothing)
+End Function
+
+' Work minutes per week. Keys are "yyyy-mm-dd" week starts.
+Public Function WeeklyWork(a As Assignment) As Object
+    Dim d As Object, tsv As TimeScaleValues, i As Long, m As Double, k As String
+    Dim ck As String
+
+    ' TimeScaleData is the single most expensive call in here. Within one run
+    ' the answer for a given assignment doesn't change, so ask once.
+    If Not mWWCache Is Nothing Then
+        ck = CStr(a.UniqueID)
+        If mWWCache.Exists(ck) Then
+            Set WeeklyWork = mWWCache(ck)
+            Exit Function
+        End If
+    End If
+
+    Set d = NewDict()
+    If Not mWWCache Is Nothing Then Set mWWCache(ck) = d
+    On Error GoTo Done
+    Set tsv = a.TimeScaleData(a.Start, a.Finish, pjAssignmentTimescaledWork, pjTimescaleWeeks, 1)
+    For i = 1 To tsv.Count
+        m = ToDbl(tsv.Item(i).Value)
+        If m > 0 Then
+            k = Format$(tsv.Item(i).StartDate, "yyyy-mm-dd")
+            d(k) = ToDbl(d(k)) + m
+        End If
+    Next i
+Done:
+    Set WeeklyWork = d
+End Function
+
+Public Function SumDict(d As Object) As Double
+    Dim k As Variant
+    For Each k In d.Keys
+        SumDict = SumDict + ToDbl(d(k))
+    Next k
+End Function
+
+Public Function SortedKeys(keys As Variant) As Collection
+    Dim c As New Collection, k As Variant, i As Long, placed As Boolean
+    For Each k In keys
+        placed = False
+        For i = 1 To c.Count
+            If CStr(k) < CStr(c(i)) Then
+                c.Add CStr(k), Before:=i
+                placed = True
+                Exit For
+            End If
+        Next i
+        If Not placed Then c.Add CStr(k)
+    Next k
+    Set SortedKeys = c
+End Function
+
+Public Function JoinCollection(c As Collection, ByVal sep As String) As String
+    Dim x As Variant, s As String
+    For Each x In c
+        If s <> "" Then s = s & sep
+        s = s & CStr(x)
+    Next x
+    JoinCollection = s
+End Function
+
+Public Function TaskLabel(t As Task) As String
+    TaskLabel = "Task " & t.ID & " " & t.Name
+End Function
+
+Public Function PadR(ByVal s As String, ByVal n As Long) As String
+    If Len(s) >= n Then PadR = Left$(s, n) Else PadR = s & Space$(n - Len(s))
+End Function
+
+Public Function PadL(ByVal s As String, ByVal n As Long) As String
+    If Len(s) >= n Then PadL = Right$(s, n) Else PadL = Space$(n - Len(s)) & s
+End Function
+
+Public Function Pct(ByVal x As Double) As String
+    Pct = Format$(x * 100, "0") & "%"
+End Function
+
+' Writes a text report to %TEMP% and opens it in Notepad.
+Public Sub ShowReport(ByVal title As String, lines As Collection)
+    Dim path As String, f As Integer, ln As Variant
+    path = Environ$("TEMP") & "\RoleStaffing_" & Replace(title, " ", "_") & "_" & _
+           Format$(Now, "yyyymmdd_hhnnss") & ".txt"
+    f = FreeFile
+    Open path For Output As #f
+    Print #f, title & "   (" & ActiveProject.Name & ", " & Format$(Now, "yyyy-mm-dd hh:nn") & ")"
+    Print #f, String$(Len(title), "=")
+    Print #f, ""
+    For Each ln In lines
+        Print #f, CStr(ln)
+    Next ln
+    Close #f
+    On Error Resume Next
+    Shell "notepad.exe """ & path & """", vbNormalFocus
+    If Err.Number <> 0 Then MsgBox "Report saved to:" & vbCrLf & path, vbInformation, "Role Staffing"
+End Sub
+
+'==============================================================================
+' SPEED
+'
+' Every property read here is a COM call into Project, so the wins are: stop it
+' redrawing the Gantt after each change, stop asking it the same question twice,
+' and tell the user something is happening.
+'
+' If a big file is still slow, turn calculation off by hand while you work:
+' File > Options > Schedule > Calculation: Off. Turn it back on afterwards.
+'==============================================================================
+
+Public Sub FastOn(ByVal what As String)
+    mFastDepth = mFastDepth + 1
+    If mFastDepth > 1 Then Exit Sub
+    On Error Resume Next
+    mPrevScreen = Application.ScreenUpdating
+    Application.ScreenUpdating = False
+    Application.StatusBar = "Role Staffing: " & what & "..."
+    Set mWWCache = NewDict()
+    On Error GoTo 0
+End Sub
+
+Public Sub FastOff()
+    If mFastDepth > 0 Then mFastDepth = mFastDepth - 1
+    If mFastDepth > 0 Then Exit Sub
+    On Error Resume Next
+    Application.ScreenUpdating = mPrevScreen
+    Application.StatusBar = ""
+    Set mWWCache = Nothing
+    On Error GoTo 0
+End Sub
+
+Public Sub Progress(ByVal what As String, ByVal n As Long, ByVal outOf As Long)
+    On Error Resume Next
+    If outOf > 0 Then
+        Application.StatusBar = "Role Staffing: " & what & " " & n & " of " & outOf & "..."
+    Else
+        Application.StatusBar = "Role Staffing: " & what & " " & n & "..."
+    End If
+End Sub
+
+'==============================================================================
+' MANUAL-EDIT GUARD
+'==============================================================================
+
+Public Sub Auto_Open()
+    RS_StartGuard
+    EnsureRibbon
+End Sub
+
+Public Sub RS_StartGuard()
+    Set mEvents = New clsRS_AppEvents
+    Set mEvents.App = Application
+    If gRS_PendingTags Is Nothing Then Set gRS_PendingTags = NewDict()
+    gRS_GuardOn = True
+End Sub
+
+Public Sub RS_StopGuard()
+    gRS_GuardOn = False
+    Set mEvents = Nothing
+End Sub
+
+' The guard can't edit an assignment from inside a "before change" event,
+' so it stashes the role and we write it here.
+Public Sub ApplyPendingTags(p As Project)
+    Dim t As Task, a As Assignment, k As String, r As Resource
+    If gRS_PendingTags Is Nothing Then Exit Sub
+    If gRS_PendingTags.Count = 0 Then Exit Sub
+    gRS_Suppress = gRS_Suppress + 1
+    On Error Resume Next
+    For Each t In p.Tasks
+        If Not t Is Nothing Then
+            For Each a In t.Assignments
+                k = CStr(a.UniqueID)
+                If gRS_PendingTags.Exists(k) Then
+                    Set r = ResourceOf(p, a)
+                    If Not IsBucket(r) Then SetAsgRole a, CStr(gRS_PendingTags(k))
+                End If
+            Next a
+        End If
+    Next t
+    gRS_PendingTags.RemoveAll
+    On Error GoTo 0
+    gRS_Suppress = gRS_Suppress - 1
+End Sub
+
+' Called by the guard. Returns "" if the edit is fine, else why it isn't.
+Public Function GuardCheck(asg As Assignment, newRes As Resource, ByRef roleOut As String) As String
+    Dim p As Project, t As Task, cur As Resource, role As String
+
+    Set p = ActiveProject
+    BuildCatalog p
+    BuildRules
+
+    Set t = TaskByUid(p, asg.TaskUniqueID)
+    role = NormalizeRole(GetAsgRole(asg))
+    If role = "" Then
+        Set cur = ResourceOf(p, asg)
+        If IsBucket(cur) Then role = BucketRole(cur)
+    End If
+    If role = "" And Not t Is Nothing Then role = GetTaskRole(t)
+    roleOut = role
+    If role = "" Then Exit Function
+
+    BuildRelations p
+    GuardCheck = FindConflict(asg.TaskUniqueID, newRes.ID, role, asg.UniqueID)
+End Function

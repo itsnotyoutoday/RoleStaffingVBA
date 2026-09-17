@@ -1,0 +1,3 @@
+[submodule "vendor/VBAlidator"]
+	path = vendor/VBAlidator
+	url = https://github.com/itsnotyoutoday/VBAlidator.git
